@@ -1,0 +1,19 @@
+[package]
+name = "upalla-lv2"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "LV2/VST3/CLAP plugin for Upalla noise suppression"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+upalla-core = { path = "../upalla-core" }
+truce = "0.57"
+truce-lv2 = "0.57"
+truce-gui = "0.57"
+truce-gui-types = "0.57"
+crossbeam-queue = "0.3"
+anyhow = "1"
+log = "0.4"

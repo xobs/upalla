@@ -1,0 +1,40 @@
+app-id: com.upalla.denoiser
+runtime: org.gnome.Platform
+runtime-version: "48"
+sdk: org.gnome.Sdk
+command: upalla-lv2
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --share=ipc
+  - --device=dri
+  - --filesystem=xdg-config/pipewire:ro
+  - --filesystem=xdg-data/pipewire:ro
+
+modules:
+  - name: onnxruntime
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -Donnxruntime_BUILD_SHARED_LIB=ON
+      - -Donnxruntime_USE_CUDA=OFF
+      - -Donnxruntime_USE_ROCM=OFF
+      - -Donnxruntime_USE_OPENVINO=OFF
+    sources:
+      - type: git
+        url: https://github.com/microsoft/onnxruntime.git
+        tag: v1.20.1
+
+  - name: upalla
+    buildsystem: simple
+    build-commands:
+      - cargo build --release -p upalla-lv2
+      - mkdir -p /app/lib/lv2/upalla.lv2
+      - cp target/release/libupalla_lv2.so /app/lib/lv2/upalla.lv2/upalla.so
+      - mkdir -p /app/share/upalla
+      - cp -r models/* /app/share/upalla/ || true
+    sources:
+      - type: dir
+        path: .

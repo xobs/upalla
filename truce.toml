@@ -1,0 +1,13 @@
+[vendor]
+name = "Upalla Project"
+id = "com.upalla"
+au_manufacturer = "Upalla Project"
+
+[[plugin]]
+name = "Upalla"
+bundle_id = "com.upalla.denoiser"
+crate = "upalla-lv2"
+version = "0.1.0"
+description = "GPU-accelerated real-time noise suppression using DeepFilterNet3"
+category = "Dynamics"
+fourcc = "UPa1"
