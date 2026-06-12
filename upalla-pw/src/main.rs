@@ -4,7 +4,7 @@
 mod pw_ffi;
 mod denoiser;
 
-use crate::denoiser::Denoiser;
+use crate::denoiser::{Denoiser, StereoChunk};
 use std::ffi::{c_void, CString};
 use std::path::PathBuf;
 use std::ptr;
@@ -42,8 +42,8 @@ fn to_c(s: &str) -> CString { CString::new(s).unwrap() }
 // Worker thread: runs denoiser off the RT audio thread.
 // Uses polling (thread::sleep) so the RT callback never does syscalls.
 struct Worker {
-    in_q: Arc<ArrayQueue<[f32; CHUNK]>>,
-    out_q: Arc<ArrayQueue<[f32; CHUNK]>>,
+    in_q: Arc<ArrayQueue<StereoChunk>>,
+    out_q: Arc<ArrayQueue<StereoChunk>>,
     done: Arc<AtomicBool>,
     reset_flag: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -51,8 +51,8 @@ struct Worker {
 impl Worker {
     fn new(model_dir: &PathBuf) -> Self {
         let model_dir = model_dir.clone();
-        let in_q: Arc<ArrayQueue<[f32; CHUNK]>> = Arc::new(ArrayQueue::new(QCAP));
-        let out_q: Arc<ArrayQueue<[f32; CHUNK]>> = Arc::new(ArrayQueue::new(QCAP));
+        let in_q: Arc<ArrayQueue<StereoChunk>> = Arc::new(ArrayQueue::new(QCAP));
+        let out_q: Arc<ArrayQueue<StereoChunk>> = Arc::new(ArrayQueue::new(QCAP));
         let done = Arc::new(AtomicBool::new(false));
         let reset_flag = Arc::new(AtomicBool::new(false));
         let iq = in_q.clone(); let oq = out_q.clone();
@@ -62,7 +62,6 @@ impl Worker {
                 Ok(d) => d,
                 Err(e) => { log::error!("Failed to create denoiser: {e}"); return; }
             };
-            let mut out_buf = [0.0f32; CHUNK];
             while !d.load(Ordering::Relaxed) {
                 if r.swap(false, Ordering::Relaxed) {
                     denoiser.reset();
@@ -71,18 +70,16 @@ impl Worker {
                 }
                 match iq.pop() {
                     Some(input) => {
-                        match denoiser.process(&input, &mut out_buf) {
-                            Ok(n) => {
-                                if n > 0 {
-                                    let _ = oq.push(out_buf);
-                                    static COUNT: AtomicU64 = AtomicU64::new(0);
-                                    let c = COUNT.fetch_add(1, Ordering::Relaxed);
-                                    if c < 3 {
-                                        let rms: f32 = (out_buf.iter().map(|&s| s*s).sum::<f32>() / n as f32).sqrt();
-                                        let in_rms: f32 = (input.iter().map(|&s| s*s).sum::<f32>() / input.len() as f32).sqrt();
-                                        log::info!("chunk #{c}: rms_in={in_rms:.4} rms_out={rms:.4}");
-                                    }
+                        match denoiser.process(&input) {
+                            Ok(out) => {
+                                static COUNT: AtomicU64 = AtomicU64::new(0);
+                                let c = COUNT.fetch_add(1, Ordering::Relaxed);
+                                if c < 3 {
+                                    let rms_l: f32 = (out.left.iter().map(|&s| s*s).sum::<f32>() / CHUNK as f32).sqrt();
+                                    let rms_r: f32 = (out.right.iter().map(|&s| s*s).sum::<f32>() / CHUNK as f32).sqrt();
+                                    log::info!("chunk #{c}: rms_out L={rms_l:.4} R={rms_r:.4}");
                                 }
+                                let _ = oq.push(out);
                             }
                             Err(e) => log::error!("denoiser: {e}"),
                         }
@@ -93,8 +90,8 @@ impl Worker {
         }).expect("spawn");
         Worker { in_q, out_q, done, reset_flag, thread: Some(thread) }
     }
-    fn send(&self, chunk: [f32; CHUNK]) { let _ = self.in_q.push(chunk); }
-    fn recv(&self) -> Option<[f32; CHUNK]> { self.out_q.pop() }
+    fn send(&self, chunk: StereoChunk) { let _ = self.in_q.push(chunk); }
+    fn recv(&self) -> Option<StereoChunk> { self.out_q.pop() }
     fn reset(&self) { self.reset_flag.store(true, Ordering::Relaxed); }
 }
 impl Drop for Worker {
@@ -109,9 +106,12 @@ struct AppData {
     in_port: *mut c_void,
     out_port: *mut c_void,
     api: &'static PwApi,
-    remainder_in: [f32; CHUNK],
-    remainder_in_len: usize,
-    remainder_out: [f32; 16384],
+    remainder_l: [f32; CHUNK],
+    remainder_l_len: usize,
+    remainder_r: [f32; CHUNK],
+    remainder_r_len: usize,
+    remainder_out_l: [f32; 16384],
+    remainder_out_r: [f32; 16384],
     remainder_out_len: usize,
     passthrough: bool,
     needs_reset: bool,
@@ -145,47 +145,60 @@ unsafe extern "C" fn on_process(userdata: *mut c_void, position: *mut spa_io_pos
     }
 
     if d.needs_reset {
-        d.remainder_in_len = 0;
+        d.remainder_l_len = 0;
+        d.remainder_r_len = 0;
         d.remainder_out_len = 0;
         d.needs_reset = false;
     }
 
-    // Drain worker output
+    // Drain worker output: interleaved stereo samples
     if let Some(ref w) = d.worker {
-        while d.remainder_out_len + CHUNK <= d.remainder_out.len() {
+        while d.remainder_out_len + 2 * CHUNK <= d.remainder_out_l.len() {
             match w.recv() {
                 Some(chunk) => {
                     let start = d.remainder_out_len;
-                    d.remainder_out[start..start + CHUNK].copy_from_slice(&chunk);
-                    d.remainder_out_len += CHUNK;
+                    for i in 0..CHUNK {
+                        d.remainder_out_l[start + 2 * i] = chunk.left[i];
+                        d.remainder_out_l[start + 2 * i + 1] = chunk.right[i];
+                    }
+                    d.remainder_out_len += 2 * CHUNK;
                 }
                 None => break,
             }
         }
     }
 
-    // Feed input to worker
+    // Feed input to worker: deinterleave L,R,L,R into left/right buffers
     let mut pos = 0;
-    while pos < n || d.remainder_in_len >= CHUNK {
-        while d.remainder_in_len < CHUNK && pos < n {
-            d.remainder_in[d.remainder_in_len] = input[pos];
-            d.remainder_in_len += 1; pos += 1;
+    while pos < n || d.remainder_l_len >= CHUNK {
+        // Accumulate left samples
+        while d.remainder_l_len < CHUNK && pos + 1 < n {
+            d.remainder_l[d.remainder_l_len] = input[pos];
+            d.remainder_r[d.remainder_r_len] = input[pos + 1];
+            d.remainder_l_len += 1;
+            d.remainder_r_len += 1;
+            pos += 2;
         }
-        if d.remainder_in_len < CHUNK { break; }
-        if d.remainder_in_len >= CHUNK {
-            if let Some(ref w) = d.worker { w.send(d.remainder_in); }
-            d.remainder_in.copy_within(CHUNK.., 0);
-            d.remainder_in_len -= CHUNK;
+        if d.remainder_l_len < CHUNK || d.remainder_r_len < CHUNK { break; }
+        // Both channels have enough — send pair
+        if let Some(ref w) = d.worker {
+            let chunk = StereoChunk {
+                left: d.remainder_l,
+                right: d.remainder_r,
+            };
+            w.send(chunk);
         }
+        d.remainder_l_len = 0;
+        d.remainder_r_len = 0;
     }
 
-    // Write output
-    let copy = d.remainder_out_len.min(n);
-    output[..copy].copy_from_slice(&d.remainder_out[..copy]);
-    if copy < d.remainder_out_len {
-        d.remainder_out.copy_within(copy..d.remainder_out_len, 0);
+    // Write output: interleaved from remainder
+    let out_samples = d.remainder_out_len.min(n);
+    output[..out_samples].copy_from_slice(&d.remainder_out_l[..out_samples]);
+    if out_samples < d.remainder_out_len {
+        d.remainder_out_l.copy_within(out_samples..d.remainder_out_len, 0);
     }
-    d.remainder_out_len -= copy;
+    d.remainder_out_len -= out_samples;
 }
 
 fn main() -> Result<()> {
@@ -219,8 +232,10 @@ fn main() -> Result<()> {
         let mut app = Box::new(AppData {
             worker,
             in_port: ptr::null_mut(), out_port: ptr::null_mut(), api: api_ref,
-            remainder_in: [0.0f32; CHUNK], remainder_in_len: 0,
-            remainder_out: [0.0f32; 16384], remainder_out_len: 0,
+            remainder_l: [0.0f32; CHUNK], remainder_l_len: 0,
+            remainder_r: [0.0f32; CHUNK], remainder_r_len: 0,
+            remainder_out_l: [0.0f32; 16384], remainder_out_r: [0.0f32; 16384],
+            remainder_out_len: 0,
             passthrough, needs_reset: false,
         });
 
@@ -241,9 +256,9 @@ fn main() -> Result<()> {
         if filter.is_null() { anyhow::bail!("filter"); }
 
         let in_props = call_pw_properties_new_string(api_ref,
-            to_c(r#"{"format.dsp":"32 bit float mono audio","port.name":"input"}"#).as_ptr());
+            to_c(r#"{"format.dsp":"32 bit float stereo audio","port.name":"input"}"#).as_ptr());
         let out_props = call_pw_properties_new_string(api_ref,
-            to_c(r#"{"format.dsp":"32 bit float mono audio","port.name":"output"}"#).as_ptr());
+            to_c(r#"{"format.dsp":"32 bit float stereo audio","port.name":"output"}"#).as_ptr());
 
         app.in_port = call_pw_filter_add_port(api_ref, filter, PW_DIRECTION_INPUT,
             PW_FILTER_PORT_FLAG_MAP_BUFFERS, 4, in_props, ptr::null(), 0);

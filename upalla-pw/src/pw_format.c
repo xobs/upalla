@@ -25,7 +25,7 @@ struct PwFormatParams *upalla_build_format_params(void) {
 
     struct spa_audio_info_raw info = {0};
     info.format = SPA_AUDIO_FORMAT_F32;
-    info.channels = 1;
+    info.channels = 2;
     info.rate = 48000;
 
     p->params[1] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &info);

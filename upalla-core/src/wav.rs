@@ -8,35 +8,35 @@ pub fn read_wav_stereo(path: &Path) -> anyhow::Result<(Vec<f32>, Vec<f32>, u32)>
     let sr = spec.sample_rate;
     let ch = spec.channels as usize;
 
-    let samples: Vec<i16> = if spec.sample_format == hound::SampleFormat::Int {
-        reader
+    let (left, right): (Vec<f32>, Vec<f32>) = if spec.sample_format == hound::SampleFormat::Int {
+        let samples: Vec<i16> = reader
             .samples::<i16>()
             .collect::<Result<Vec<i16>, _>>()
-            .map_err(|e| anyhow::anyhow!("WAV read error: {e}"))?
+            .map_err(|e| anyhow::anyhow!("WAV read error: {e}"))?;
+        let n = samples.len();
+        let mut l = Vec::with_capacity(n / ch);
+        let mut r = Vec::with_capacity(n / ch);
+        for i in 0..n / ch {
+            l.push(samples[i * ch] as f32 / 32767.0);
+            r.push(if ch >= 2 { samples[i * ch + 1] as f32 / 32767.0 } else { l[i] });
+        }
+        (l, r)
     } else if spec.sample_format == hound::SampleFormat::Float {
-        let f32_samples: Vec<f32> = reader
+        let samples: Vec<f32> = reader
             .samples::<f32>()
             .collect::<Result<Vec<f32>, _>>()
             .map_err(|e| anyhow::anyhow!("WAV read error: {e}"))?;
-        f32_samples
-            .iter()
-            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-            .collect()
+        let n = samples.len();
+        let mut l = Vec::with_capacity(n / ch);
+        let mut r = Vec::with_capacity(n / ch);
+        for i in 0..n / ch {
+            l.push(samples[i * ch]);
+            r.push(if ch >= 2 { samples[i * ch + 1] } else { l[i] });
+        }
+        (l, r)
     } else {
         anyhow::bail!("Unsupported WAV sample format");
     };
-
-    let n = samples.len();
-    let mut left = Vec::with_capacity(n / ch);
-    let mut right = Vec::with_capacity(n / ch);
-    for i in 0..n / ch {
-        left.push(samples[i * ch] as f32 / 32768.0);
-        if ch >= 2 {
-            right.push(samples[i * ch + 1] as f32 / 32768.0);
-        } else {
-            right.push(left[i]);
-        }
-    }
 
     Ok((left, right, sr))
 }

@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use df::tract::{DfParams, DfTract, RuntimeParams};
-use ndarray::{ArrayView2, ArrayViewMut2, ShapeBuilder};
+use df::tract::{DfParams, DfTract, ReduceMask, RuntimeParams};
+use ndarray::Array2;
 
 #[derive(Parser)]
 struct Args {
@@ -30,9 +30,10 @@ fn main() -> Result<()> {
 
     log::info!("Loading model...");
     let params = DfParams::default();
-    let rp = RuntimeParams::default_with_ch(1)
+    let rp = RuntimeParams::default_with_ch(2)
         .with_atten_lim(args.atten_lim_db)
-        .with_thresholds(-15.0, 35.0, 35.0);
+        .with_thresholds(-15.0, 35.0, 35.0)
+        .with_mask_reduce(ReduceMask::MAX);
     let mut model = DfTract::new(params, &rp)?;
     if args.post_filter {
         model.set_pf_beta(args.post_filter_beta);
@@ -45,31 +46,29 @@ fn main() -> Result<()> {
     let n_frames = n / hop;
     let n_pad = n_frames * hop;
 
-    let process_channel = |model: &mut DfTract, input: &[f32]| -> Result<Vec<f32>> {
-        let mut output = vec![0.0f32; n_pad];
-        let mut enhanced = vec![0.0f32; hop];
-        for i in 0..n_frames {
-            let start = i * hop;
-            let noisy_view = ArrayView2::from_shape((1, hop).f(), &input[start..start + hop])?;
-            let mut enh_view = ArrayViewMut2::from_shape((1, hop).f(), &mut enhanced)?;
-            model.process(noisy_view, enh_view)?;
-            output[start..start + hop].copy_from_slice(&enhanced);
-        }
-        Ok(output)
-    };
+    let mut enhanced_left = vec![0.0f32; n_pad];
+    let mut enhanced_right = vec![0.0f32; n_pad];
 
     let t0 = Instant::now();
-    let enhanced_left = process_channel(&mut model, &left)?;
+    for i in 0..n_frames {
+        let start = i * hop;
+        let end = start + hop;
 
-    let params2 = DfParams::default();
-    let rp2 = RuntimeParams::default_with_ch(1)
-        .with_atten_lim(args.atten_lim_db)
-        .with_thresholds(-15.0, 35.0, 35.0);
-    let mut model2 = DfTract::new(params2, &rp2)?;
-    if args.post_filter {
-        model2.set_pf_beta(args.post_filter_beta);
+        let mut frame = Array2::<f32>::zeros((2, hop));
+        frame.row_mut(0).as_slice_mut().unwrap().copy_from_slice(&left[start..end]);
+        frame.row_mut(1).as_slice_mut().unwrap().copy_from_slice(&right[start..end]);
+
+        let noisy_view = frame.view();
+        let mut enhanced = Array2::<f32>::zeros((2, hop));
+        let mut enh_view = enhanced.view_mut();
+
+        model.process(noisy_view, enh_view)?;
+
+        enhanced_left[start..end]
+            .copy_from_slice(enhanced.row(0).as_slice().unwrap());
+        enhanced_right[start..end]
+            .copy_from_slice(enhanced.row(1).as_slice().unwrap());
     }
-    let enhanced_right = process_channel(&mut model2, &right)?;
 
     let elapsed = t0.elapsed().as_secs_f32();
     let audio_len = n_pad as f32 / sr as f32;
