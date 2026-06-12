@@ -10,16 +10,10 @@ name = "upalla-wav"
 path = "src/bin/upalla-wav.rs"
 
 [dependencies]
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
 df = { package = "deep_filter", path = "../../DeepFilterNet/libDF", features = ["tract", "default-model-ll"] }
 ndarray = { version = "0.17" }
-itertools = "0.12"
-num-complex = "0.4"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
 hound = "3.5"
-flate2 = "1"
-tar = "0.4"
-rust-ini = "0.21"

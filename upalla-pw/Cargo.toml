@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 upalla-core = { path = "../upalla-core" }
+df = { package = "deep_filter", path = "../../DeepFilterNet/libDF", features = ["tract", "default-model-ll"] }
+ndarray = "0.17"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

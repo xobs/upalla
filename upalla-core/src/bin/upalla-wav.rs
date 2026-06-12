@@ -3,12 +3,19 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use upalla_core::ort_tract::OrtDfTract;
+use df::tract::{DfParams, DfTract, RuntimeParams};
+use ndarray::{ArrayView2, ArrayViewMut2, ShapeBuilder};
 
 #[derive(Parser)]
 struct Args {
     #[arg(short, long, default_value_t = 100.)]
     atten_lim_db: f32,
+
+    #[arg(long)]
+    post_filter: bool,
+
+    #[arg(long, default_value_t = 0.02)]
+    post_filter_beta: f32,
 
     input_file: PathBuf,
     output_file: PathBuf,
@@ -22,9 +29,14 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     log::info!("Loading model...");
-    let config = upalla_core::load_config()?;
-    let mut model = OrtDfTract::new(&config, 1)?;
-    model.set_atten_lim(args.atten_lim_db);
+    let params = DfParams::default();
+    let rp = RuntimeParams::default_with_ch(1)
+        .with_atten_lim(args.atten_lim_db)
+        .with_thresholds(-15.0, 35.0, 35.0);
+    let mut model = DfTract::new(params, &rp)?;
+    if args.post_filter {
+        model.set_pf_beta(args.post_filter_beta);
+    }
 
     log::info!("Reading {}", args.input_file.display());
     let (left, right, sr) = upalla_core::wav::read_wav_stereo(&args.input_file)?;
@@ -33,14 +45,15 @@ fn main() -> Result<()> {
     let n_frames = n / hop;
     let n_pad = n_frames * hop;
 
-    let process_channel = |model: &mut OrtDfTract, input: &[f32]| -> Result<Vec<f32>> {
+    let process_channel = |model: &mut DfTract, input: &[f32]| -> Result<Vec<f32>> {
         let mut output = vec![0.0f32; n_pad];
+        let mut enhanced = vec![0.0f32; hop];
         for i in 0..n_frames {
             let start = i * hop;
-            let noisy = vec![input[start..start + hop].to_vec()];
-            let mut enh = vec![vec![0.0f32; hop]];
-            model.process(&noisy, &mut enh)?;
-            output[start..start + hop].copy_from_slice(&enh[0]);
+            let noisy_view = ArrayView2::from_shape((1, hop).f(), &input[start..start + hop])?;
+            let mut enh_view = ArrayViewMut2::from_shape((1, hop).f(), &mut enhanced)?;
+            model.process(noisy_view, enh_view)?;
+            output[start..start + hop].copy_from_slice(&enhanced);
         }
         Ok(output)
     };
@@ -48,9 +61,14 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let enhanced_left = process_channel(&mut model, &left)?;
 
-    let config2 = upalla_core::load_config()?;
-    let mut model2 = OrtDfTract::new(&config2, 1)?;
-    model2.set_atten_lim(args.atten_lim_db);
+    let params2 = DfParams::default();
+    let rp2 = RuntimeParams::default_with_ch(1)
+        .with_atten_lim(args.atten_lim_db)
+        .with_thresholds(-15.0, 35.0, 35.0);
+    let mut model2 = DfTract::new(params2, &rp2)?;
+    if args.post_filter {
+        model2.set_pf_beta(args.post_filter_beta);
+    }
     let enhanced_right = process_channel(&mut model2, &right)?;
 
     let elapsed = t0.elapsed().as_secs_f32();
