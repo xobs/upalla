@@ -4,75 +4,72 @@ GPU-agnostic real-time noise suppression for Linux using **DeepFilterNet3**.
 
 Works with NVIDIA, AMD, Intel GPUs — or CPU only — via ONNX Runtime.
 
+## Quick Start
+
+```bash
+# 1. Download the model
+./scripts/download-model.sh
+
+# 2. Build and run the native filter
+cargo build -p upalla-pw --release
+./target/release/upalla
+```
+
+A "Upalla Denoiser" audio source appears. Route your microphone through it using `pavucontrol`, `helvum`, or `qpwgraph`. Press Ctrl-C to stop.
+
+No PipeWire config files, no LV2 plugin installation needed.
+
 ## Architecture
 
 ```
-Microphone → PipeWire → Upalla LV2 Plugin → ONNX Runtime → Denoised Audio
-                              ↕                    ↕
-                         Audio Thread          Worker Thread
-                         (real-time)       (GPU inference off-RT)
+Microphone → PipeWire → upalla (native filter) → ONNX Runtime → Denoised Audio
+                              ↕                         ↕
+                         RT Audio Thread           Main Thread
+                         (process callback)    (synchronous ONNX CPU EP)
 ```
 
 ## Building
 
 ```bash
-# Prerequisites
-# Rust 1.92+, libonnxruntime.so (system or vendored)
+# Prerequisites: Rust 1.92+, libonnxruntime.so (system or vendored)
 
-# Clone
-git clone https://github.com/upalla/upalla
-cd upalla
+# CLI WAV denoiser
+cargo build -p upalla-pw --release
+./target/release/upalla input.wav output.wav
 
-# Build core library
-cargo build -p upalla-core
-
-# Build LV2 plugin
+# LV2 plugin (requires PipeWire compiled with LV2 support)
 cargo build -p upalla-lv2 --release
-
-# Install LV2 plugin
-mkdir -p ~/.lv2
-cp target/release/libupalla_lv2.so ~/.lv2/upalla.lv2/upalla.so
+./scripts/install-lv2.sh
 ```
 
 ## Model Setup
 
-Download the DeepFilterNet3 ONNX model:
-
 ```bash
-mkdir -p ~/.local/share/upalla
-# Download from HuggingFace (choose one):
-# Option 1: Serkan007's tarball
-wget https://huggingface.co/Serkan007/DeepFilterNet3-ONNX/resolve/main/DeepFilterNet3_onnx.tar.gz
-tar xzf DeepFilterNet3_onnx.tar.gz -C ~/.local/share/upalla/
-
-# Option 2: Export from PyTorch
-pip install deepfilternet
-python -c "
-from df.scripts.export import main
-main()
-"
+./scripts/download-model.sh
 ```
 
-Also download the auxiliary data (ERB filterbank + Vorbis window):
+Downloads `enc.onnx`, `erb_dec.onnx`, `df_dec.onnx` to `~/.local/share/upalla/`.
+
+## GPU Setup
+
+Install ONNX Runtime for your GPU, or use the CPU fallback (bundled with most distros):
+
+| GPU | Package |
+|---|---|
+| AMD ROCm | `onnxruntime-rocm` |
+| NVIDIA CUDA | `onnxruntime-cuda` |
+| Intel OpenVINO | `onnxruntime-openvino` |
+| CPU fallback | `onnxruntime` (works without GPU) |
+
+If ONNX Runtime is installed to a non-standard path (e.g. `/usr/lib64/rocm/lib/`), set:
 
 ```bash
-wget https://huggingface.co/soniqo/DeepFilterNet3-ONNX/resolve/main/deepfilter-auxiliary.bin \
-  -O ~/.local/share/upalla/auxiliary.bin
+export ORT_DYLIB_PATH=/usr/lib64/rocm/lib/libonnxruntime.so.1.22.2
 ```
 
-## PipeWire Setup
+Upalla auto-searches common ROCm/CUDA paths. Set `ORT_DYLIB_PATH` if auto-detection fails.
 
-Copy the provided config:
-
-```bash
-mkdir -p ~/.config/pipewire/pipewire.conf.d
-cp config/upalla.conf ~/.config/pipewire/pipewire.conf.d/99-upalla.conf
-systemctl restart --user pipewire
-```
-
-Your "Upalla Denoiser" virtual microphone should now appear in audio settings.
-
-## Parameters
+## Parameters (LV2 plugin only)
 
 | Parameter | Range | Default | Description |
 |---|---|---|---|

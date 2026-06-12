@@ -14,16 +14,16 @@ use crate::params::{UpallaParams, UpallaParamsParamId};
 use crate::worker::{GpuTask, WorkerChannel};
 
 const MODEL_SEARCH_PATHS: &[&str] = &[
-    "/usr/share/upalla/deepfilter.onnx",
-    "/usr/local/share/upalla/deepfilter.onnx",
-    ".local/share/upalla/deepfilter.onnx",
-    "upalla/models/deepfilter.onnx",
+    "/usr/share/upalla",
+    "/usr/local/share/upalla",
+    ".local/share/upalla",
+    "upalla/models",
 ];
 
-fn find_model() -> Option<PathBuf> {
+fn find_model_dir() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(home).join(".local/share/upalla/deepfilter.onnx");
-        if path.exists() {
+        let path = PathBuf::from(home).join(".local/share/upalla");
+        if has_model(&path) {
             return Some(path);
         }
     }
@@ -31,18 +31,24 @@ fn find_model() -> Option<PathBuf> {
         if search.starts_with('.') {
             if let Ok(home) = std::env::var("HOME") {
                 let path = PathBuf::from(home).join(search);
-                if path.exists() {
+                if has_model(&path) {
                     return Some(path);
                 }
             }
         } else {
             let path = PathBuf::from(search);
-            if path.exists() {
+            if has_model(&path) {
                 return Some(path);
             }
         }
     }
     None
+}
+
+fn has_model(dir: &PathBuf) -> bool {
+    dir.join("enc.onnx").exists()
+        && dir.join("erb_dec.onnx").exists()
+        && dir.join("df_dec.onnx").exists()
 }
 
 pub struct UpallaPlugin {
@@ -70,9 +76,9 @@ impl UpallaPlugin {
         let aux = Auxiliary::new();
         let window = aux.window.clone();
 
-        let model_path = find_model();
+        let model_dir = find_model_dir();
 
-        let (worker, cpu_denoiser) = if let Some(ref path) = model_path {
+        let (worker, cpu_denoiser) = if let Some(ref path) = model_dir {
             log::info!("Loading model from {:?}", path);
             match Denoiser::new(path.clone()) {
                 Ok(denoiser) => {
@@ -95,9 +101,9 @@ impl UpallaPlugin {
             }
         } else {
             log::warn!(
-                "No ONNX model found at ~/.local/share/upalla/deepfilter.onnx. \
+                "No ONNX model found at ~/.local/share/upalla/. \
                  Audio will pass through unprocessed. \
-                 Run 'upalla-download-model' to fetch the model."
+                 Run 'scripts/download-model.sh' to fetch the model."
             );
             (None, None)
         };

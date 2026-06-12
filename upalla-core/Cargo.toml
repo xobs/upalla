@@ -5,12 +5,22 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "GPU-agnostic real-time noise suppression engine using DeepFilterNet3"
 
+[[bin]]
+name = "upalla-wav"
+path = "src/bin/upalla-wav.rs"
+
 [dependencies]
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
-rustfft = { version = "6", features = ["avx", "sse"] }
+df = { package = "deep_filter", path = "../../DeepFilterNet/libDF", features = ["tract", "default-model-ll"] }
+rustfft = "6"
 realfft = "3"
-ndarray = "0.16"
+ndarray = { version = "0.17", features = ["approx"] }
+itertools = "0.12"
+num-complex = "0.4"
 anyhow = "1"
-bytemuck = "1"
 log = "0.4"
-thiserror = "2"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
+flate2 = "1"
+tar = "0.4"
+rust-ini = "0.21"
