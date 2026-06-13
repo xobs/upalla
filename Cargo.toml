@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["upalla-core", "upalla-lv2", "upalla-pw"]
+members = ["upalla-core", "upalla-lv2", "upalla-pw", "upalla-pa"]
 
 [workspace.package]
 version = "0.1.0"

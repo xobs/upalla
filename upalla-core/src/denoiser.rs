@@ -4,7 +4,7 @@ use anyhow::Result;
 use df::tract::{DfParams, DfTract, ReduceMask, RuntimeParams};
 use ndarray::Array2;
 
-const CHUNK: usize = 480;
+pub const CHUNK: usize = 480;
 
 pub struct StereoChunk {
     pub left: [f32; CHUNK],
@@ -16,9 +16,9 @@ pub struct Denoiser {
 }
 
 impl Denoiser {
-    pub fn new(_model_dir: &Path) -> Result<Self> {
+    pub fn new(_model_dir: &Path, channels: usize) -> Result<Self> {
         let params = DfParams::default();
-        let rp = RuntimeParams::default_with_ch(2)
+        let rp = RuntimeParams::default_with_ch(channels)
             .with_atten_lim(100.0)
             .with_thresholds(-15.0, 35.0, 35.0)
             .with_mask_reduce(ReduceMask::MAX);
@@ -26,21 +26,29 @@ impl Denoiser {
         Ok(Denoiser { model })
     }
 
-    pub fn process(&mut self, input: &StereoChunk) -> Result<StereoChunk> {
+    pub fn process_stereo(&mut self, input: &StereoChunk) -> Result<StereoChunk> {
         let mut frame = Array2::<f32>::zeros((2, CHUNK));
         frame.row_mut(0).as_slice_mut().unwrap().copy_from_slice(&input.left);
         frame.row_mut(1).as_slice_mut().unwrap().copy_from_slice(&input.right);
-
         let noisy_view = frame.view();
         let mut enhanced = Array2::<f32>::zeros((2, CHUNK));
-        let mut enh_view = enhanced.view_mut();
-
+        let enh_view = enhanced.view_mut();
         self.model.process(noisy_view, enh_view)?;
-
         let mut out = StereoChunk { left: [0.0; CHUNK], right: [0.0; CHUNK] };
         out.left.copy_from_slice(enhanced.row(0).as_slice().unwrap());
         out.right.copy_from_slice(enhanced.row(1).as_slice().unwrap());
         Ok(out)
+    }
+
+    pub fn process_mono(&mut self, input: &[f32; CHUNK], output: &mut [f32; CHUNK]) -> Result<usize> {
+        let mut frame = Array2::<f32>::zeros((1, CHUNK));
+        frame.row_mut(0).as_slice_mut().unwrap().copy_from_slice(input);
+        let noisy_view = frame.view();
+        let mut enhanced = Array2::<f32>::zeros((1, CHUNK));
+        let enh_view = enhanced.view_mut();
+        self.model.process(noisy_view, enh_view)?;
+        output.copy_from_slice(enhanced.row(0).as_slice().unwrap());
+        Ok(CHUNK)
     }
 
     pub fn reset(&mut self) {

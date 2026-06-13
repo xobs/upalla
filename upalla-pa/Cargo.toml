@@ -1,0 +1,17 @@
+[package]
+name = "upalla-pa"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "PulseAudio filter for Upalla noise suppression"
+
+[[bin]]
+name = "upalla-pa"
+path = "src/main.rs"
+
+[dependencies]
+upalla-core = { path = "../upalla-core" }
+libpulse-binding = "2.30"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"

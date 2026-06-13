@@ -2,9 +2,8 @@
 //! Usage:  upalla [--passthrough]
 
 mod pw_ffi;
-mod denoiser;
 
-use crate::denoiser::{Denoiser, StereoChunk};
+use crate::pw_ffi::*;
 use std::ffi::{c_void, CString};
 use std::path::PathBuf;
 use std::ptr;
@@ -15,9 +14,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam_queue::ArrayQueue;
-use pw_ffi::*;
+use upalla_core::denoiser::{Denoiser, StereoChunk, CHUNK};
 
-const CHUNK: usize = 480;
 const QCAP: usize = 64;
 
 static PW_API: OnceLock<PwApi> = OnceLock::new();
@@ -58,7 +56,7 @@ impl Worker {
         let iq = in_q.clone(); let oq = out_q.clone();
         let d = done.clone(); let r = reset_flag.clone();
         let thread = thread::Builder::new().name("upalla-worker".into()).spawn(move || {
-            let mut denoiser = match Denoiser::new(&model_dir) {
+            let mut denoiser = match Denoiser::new(&model_dir, 2) {
                 Ok(d) => d,
                 Err(e) => { log::error!("Failed to create denoiser: {e}"); return; }
             };
@@ -70,7 +68,7 @@ impl Worker {
                 }
                 match iq.pop() {
                     Some(input) => {
-                        match denoiser.process(&input) {
+                        match denoiser.process_stereo(&input) {
                             Ok(out) => {
                                 static COUNT: AtomicU64 = AtomicU64::new(0);
                                 let c = COUNT.fetch_add(1, Ordering::Relaxed);
