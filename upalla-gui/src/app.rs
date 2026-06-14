@@ -1,19 +1,11 @@
 use upalla_pa::DeviceInfo;
 use upalla_pa::DeviceLists;
 
-use crate::tray::TrayMenuIds;
-use crate::TrayAction;
-
 pub struct AppGuiState {
     pub bypass: bool,
     pub buffer_ms: u32,
     pub rms_in: f32,
     pub rms_out: f32,
-
-    tray_ids: Option<TrayMenuIds>,
-    show_window: bool,
-    start_hidden: bool,
-    pending_actions: Vec<TrayAction>,
 
     sinks: Vec<DeviceInfo>,
     sources: Vec<DeviceInfo>,
@@ -25,16 +17,12 @@ pub struct AppGuiState {
 }
 
 impl AppGuiState {
-    pub fn new(tray_ids: Option<TrayMenuIds>) -> Self {
+    pub fn new() -> Self {
         AppGuiState {
             bypass: false,
             buffer_ms: 48,
             rms_in: 0.0,
             rms_out: 0.0,
-            tray_ids,
-            show_window: false,
-            start_hidden: true,
-            pending_actions: Vec::new(),
             sinks: Vec::new(),
             sources: Vec::new(),
             default_sink_display: String::new(),
@@ -43,38 +31,6 @@ impl AppGuiState {
             selected_source: String::new(),
             refresh_devices: true,
         }
-    }
-
-    pub fn handle_tray_event(&mut self, event: tray_icon::menu::MenuEvent) {
-        let Some(ids) = &self.tray_ids else {
-            return;
-        };
-        if event.id == ids.show_hide {
-            if self.show_window {
-                self.pending_actions.push(TrayAction::Hide);
-                self.show_window = false;
-            } else {
-                self.pending_actions.push(TrayAction::Show);
-                self.show_window = true;
-            }
-        } else if event.id == ids.enabled {
-            self.pending_actions.push(TrayAction::ToggleEnabled);
-        } else if event.id == ids.quit {
-            self.pending_actions.push(TrayAction::Quit);
-        }
-    }
-
-    pub fn start_hidden(&mut self) -> bool {
-        if self.start_hidden {
-            self.start_hidden = false;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn drain_pending_actions(&mut self) -> Vec<TrayAction> {
-        std::mem::take(&mut self.pending_actions)
     }
 
     pub fn set_devices(&mut self, lists: DeviceLists) {
@@ -195,6 +151,10 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
         ui.add_space(4.0);
         let mut enabled = !state.bypass;
         if ui.checkbox(&mut enabled, "Enabled").changed() {
+            log::trace!(
+                "\"Enabled\" checkbox changed, enabled is now {enabled} (bypass is now {})",
+                !enabled
+            );
             state.bypass = !enabled;
         }
 

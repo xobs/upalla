@@ -284,7 +284,7 @@ pub fn run_filter(
     model: Model,
     cmd_rx: Receiver<Cmd>,
     status_tx: Sender<Status>,
-    bypass: Arc<AtomicBool>,
+    enable: Arc<AtomicBool>,
 ) -> Result<()> {
     cleanup_stale_modules();
 
@@ -477,7 +477,7 @@ pub fn run_filter(
         pump_read(&mut sink_rec, &mut sink_in);
         pump_read(&mut src_rec, &mut src_in);
 
-        let is_bypass = bypass.load(Ordering::Relaxed);
+        let is_bypass = !enable.load(Ordering::Relaxed);
 
         while let Some(frame) = sink_in.drain_frames(frame_size) {
             let mut sc = StereoChunk {

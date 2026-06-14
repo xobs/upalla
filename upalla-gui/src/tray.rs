@@ -25,7 +25,8 @@ mod linux_impl {
         let menu = Menu::new();
 
         let show_hide = MenuItem::new("Show", true, None);
-        let enabled_item = CheckMenuItem::new("Enabled", true, enabled.load(Ordering::Relaxed), None);
+        let enabled_item =
+            CheckMenuItem::new("Enabled", true, enabled.load(Ordering::Relaxed), None);
         let quit = MenuItem::new("Quit", true, None);
 
         let ids = TrayMenuIds {
@@ -38,8 +39,7 @@ mod linux_impl {
         menu.append(&enabled_item).expect("append");
         menu.append(&quit).expect("append");
 
-        let icon =
-            tray_icon::Icon::from_rgba(vec![0u8; 64 * 64 * 4], 64, 64).expect("create icon");
+        let icon = tray_icon::Icon::from_rgba(vec![0u8; 64 * 64 * 4], 64, 64).expect("create icon");
 
         let _tray = TrayIconBuilder::new()
             .with_tooltip("Upalla")
@@ -72,10 +72,6 @@ mod linux_impl {
 pub use linux_impl::run_tray;
 
 #[cfg(not(target_os = "linux"))]
-pub fn run_tray(
-    _done: Arc<AtomicBool>,
-    _ids_tx: Sender<TrayMenuIds>,
-    _enabled: Arc<AtomicBool>,
-) {
+pub fn run_tray(_done: Arc<AtomicBool>, _ids_tx: Sender<TrayMenuIds>, _enabled: Arc<AtomicBool>) {
     std::thread::sleep(std::time::Duration::from_secs(u64::MAX));
 }

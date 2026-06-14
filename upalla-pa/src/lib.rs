@@ -13,35 +13,40 @@ pub use filter::{DeviceInfo, DeviceLists, Status};
 pub struct PaFilter {
     cmd_tx: Sender<Cmd>,
     status_rx: Receiver<Status>,
-    bypass: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    enabled: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
 }
 
 impl PaFilter {
-    pub fn new(model: Model) -> Result<Self> {
+    pub fn new(model: Model, enabled: Arc<AtomicBool>) -> Result<Self> {
         let (cmd_tx, cmd_rx) = bounded::<Cmd>(8);
         let (status_tx, status_rx) = bounded::<Status>(8);
-        let bypass = Arc::new(AtomicBool::new(false));
-        let bypass_clone = bypass.clone();
 
         let handle = std::thread::Builder::new()
             .name("upalla-pa".into())
-            .spawn(move || {
-                if let Err(e) = filter::run_filter(model, cmd_rx, status_tx, bypass_clone) {
-                    log::error!("PA filter thread error: {e}");
+            .spawn({
+                let enabled = Arc::clone(&enabled);
+                move || {
+                    if let Err(e) = filter::run_filter(model, cmd_rx, status_tx, enabled) {
+                        log::error!("PA filter thread error: {e}");
+                    }
                 }
             })?;
 
         Ok(PaFilter {
             cmd_tx,
             status_rx,
-            bypass,
-            handle: Some(handle),
+            enabled,
+            handle,
         })
     }
 
     pub fn set_bypass(&self, bypass: bool) {
-        self.bypass.store(bypass, Ordering::Relaxed);
+        self.enabled.store(!bypass, Ordering::Relaxed);
+    }
+
+    pub fn bypass(&self) -> bool {
+        !self.enabled.load(Ordering::Relaxed)
     }
 
     pub fn switch_model(&self, model: Model) {
@@ -71,22 +76,13 @@ impl PaFilter {
         &self.status_rx
     }
 
-    pub fn shutdown(&mut self) -> bool {
+    pub fn shutdown(&self) -> bool {
         let _ = self.cmd_tx.send(Cmd::Shutdown);
-        let Some(h) = self.handle.take() else {
-            return false;
-        };
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !h.is_finished() && std::time::Instant::now() < deadline {
+        while !self.handle.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        h.is_finished() && h.join().is_ok()
-    }
-}
-
-impl Drop for PaFilter {
-    fn drop(&mut self) {
-        self.shutdown();
+        self.handle.is_finished()
     }
 }

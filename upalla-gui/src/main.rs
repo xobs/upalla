@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use upalla_core::model::Model;
@@ -21,64 +21,54 @@ pub enum TrayAction {
 }
 
 struct UpallaApp {
-    pa: PaFilter,
+    pa: Arc<PaFilter>,
     gui_state: app::AppGuiState,
+    control: Receiver<Control>,
+    previous_bypass: bool,
     status_rx: Receiver<upalla_pa::Status>,
-    tray_done: Arc<AtomicBool>,
-    enabled: Arc<AtomicBool>,
-    prev_sink: String,
-    prev_source: String,
+    previous_sink: String,
+    previous_source: String,
     last_device_refresh: Instant,
+}
+
+enum Control {
+    Quit,
 }
 
 impl UpallaApp {
     fn new(
-        pa: PaFilter,
+        pa: Arc<PaFilter>,
         status_rx: Receiver<upalla_pa::Status>,
-        tray_done: Arc<AtomicBool>,
-        tray_ids: Option<tray::TrayMenuIds>,
-        enabled: Arc<AtomicBool>,
+        control: Receiver<Control>,
     ) -> Self {
+        let previous_bypass = pa.bypass();
         UpallaApp {
             pa,
-            gui_state: app::AppGuiState::new(tray_ids),
+            gui_state: app::AppGuiState::new(),
             status_rx,
-            tray_done,
-            enabled,
-            prev_sink: String::new(),
-            prev_source: String::new(),
+            control,
+            previous_bypass,
+            previous_sink: String::new(),
+            previous_source: String::new(),
             last_device_refresh: Instant::now(),
         }
     }
 }
 
 impl eframe::App for UpallaApp {
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
-
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // When the user closes the window, just hide to tray
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        }
-
-        // Hide window on first frame — go to tray
-        if self.gui_state.start_hidden() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        }
-
-        // Sync enabled state into the GUI so the checkbox is correct
-        self.gui_state.bypass = !self.enabled.load(Ordering::Relaxed);
-
-        // Poll tray menu events
-        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            self.gui_state.handle_tray_event(event);
-        }
-
+    /// Always runs, even when the window is hidden. Handles tray polling,
+    /// PA status, device refresh, and action dispatch.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll PA status
         while let Ok(status) = self.status_rx.try_recv() {
             self.gui_state.rms_in = status.rms_in;
             self.gui_state.rms_out = status.rms_out;
+        }
+
+        if let Ok(Control::Quit) = self.control.try_recv() {
+            log::debug!("Quit message received in logic -- closing viewport");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
 
         // Auto-refresh device list roughly once per second
@@ -93,55 +83,41 @@ impl eframe::App for UpallaApp {
             self.gui_state.set_devices(self.pa.enumerate_devices());
         }
 
-        // Process tray actions BEFORE rendering so the GUI reflects them
-        for action in self.gui_state.drain_pending_actions() {
-            match action {
-                TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
-                        400.0, 320.0,
-                    )));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                }
-                TrayAction::Hide => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                }
-                TrayAction::ToggleEnabled => {
-                    let was = self.enabled.load(Ordering::Relaxed);
-                    self.enabled.store(!was, Ordering::Relaxed);
-                    self.gui_state.bypass = was;
-                    self.pa.set_bypass(was);
-                }
-                TrayAction::Quit => {
-                    log::debug!("Quit event received -- cleaning up");
-                    self.tray_done.store(true, Ordering::Relaxed);
-                    self.pa.shutdown();
-                    std::process::exit(0);
-                }
-            }
-        }
-
-        // Render GUI (now with up-to-date enabled/bypass state)
-        app::render_gui(ctx, &mut self.gui_state);
-
-        // Handle device changes
-        if self.gui_state.selected_sink != self.prev_sink {
-            self.prev_sink = self.gui_state.selected_sink.clone();
+        // Handle device changes from GUI dropdown
+        if self.gui_state.selected_sink != self.previous_sink {
+            self.previous_sink = self.gui_state.selected_sink.clone();
             self.pa.set_sink(self.gui_state.selected_sink.clone());
         }
-        if self.gui_state.selected_source != self.prev_source {
-            self.prev_source = self.gui_state.selected_source.clone();
+        if self.gui_state.selected_source != self.previous_source {
+            self.previous_source = self.gui_state.selected_source.clone();
             self.pa.set_source(self.gui_state.selected_source.clone());
         }
 
-        // Sync GUI checkbox back to enabled, then to PA
-        let gui_enabled = !self.gui_state.bypass;
-        if gui_enabled != self.enabled.load(Ordering::Relaxed) {
-            self.enabled.store(gui_enabled, Ordering::Relaxed);
+        // Two-way sync: GUI checkbox → tray thread → PA
+        if self.gui_state.bypass != self.previous_bypass {
+            log::trace!(
+                "GUI bypass changed -- new state is {}",
+                self.gui_state.bypass
+            );
+            self.pa.set_bypass(self.gui_state.bypass);
+        } else if self.gui_state.bypass != self.pa.bypass() {
+            self.gui_state.bypass = self.pa.bypass();
+            log::trace!(
+                "PA bypass changed -- new state is {}",
+                self.gui_state.bypass
+            );
         }
-        self.pa.set_bypass(self.gui_state.bypass);
+        self.previous_bypass = self.gui_state.bypass;
 
-        // Always request repaints so tray events are polled even when minimized
+        // Keep the loop alive so tray events are always polled
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
+    /// Render the GUI — only called when the window is visible.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx();
+
+        app::render_gui(ctx, &mut self.gui_state);
     }
 }
 
@@ -149,23 +125,25 @@ fn main() -> Result<()> {
     env_logger::init();
     log::info!("Starting Upalla GUI...");
 
-    let pa = PaFilter::new(Model::default())?;
+    let enabled = Arc::new(AtomicBool::new(true));
+    let pa = Arc::new(PaFilter::new(Model::default(), Arc::clone(&enabled))?);
     let status_rx = pa.status_receiver().clone();
 
     let tray_done = Arc::new(AtomicBool::new(false));
-    let enabled = Arc::new(AtomicBool::new(true));
     let (ids_tx, ids_rx) = crossbeam_channel::bounded(1);
 
-    let _tray_handle = {
-        let done = tray_done.clone();
-        let en = enabled.clone();
-        thread::Builder::new()
-            .name("upalla-tray".into())
-            .spawn(move || tray::run_tray(done, ids_tx, en))
-            .expect("spawn tray")
-    };
+    let _tray_handle = thread::Builder::new()
+        .name("upalla-tray".into())
+        .spawn({
+            let tray_done = tray_done.clone();
+            let enabled = Arc::clone(&enabled);
+            move || tray::run_tray(tray_done, ids_tx, enabled)
+        })
+        .expect("spawn tray");
 
-    let tray_ids = ids_rx.recv_timeout(std::time::Duration::from_secs(3)).ok();
+    let tray_ids = ids_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .context("Unable to get tray IDs")?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -174,15 +152,49 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
-        "Upalla",
-        options,
-        Box::new(move |_cc| {
-            Ok(Box::new(UpallaApp::new(
-                pa, status_rx, tray_done, tray_ids, enabled,
-            )))
-        }),
-    )?;
+    let window_open = Arc::new(AtomicBool::new(false));
+    let (window_tx, window_rx) = crossbeam_channel::bounded(1);
+    let (control_tx, control_rx) = crossbeam_channel::bounded(1);
+    // Poll tray menu events
+    std::thread::spawn({
+        let pa = Arc::clone(&pa);
+        let window_open = Arc::clone(&window_open);
+        move || {
+            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().recv() {
+                if event.id == tray_ids.show_hide && window_tx.is_empty() {
+                    if !window_open.load(Ordering::Relaxed) {
+                        let _ = window_tx.send(());
+                    }
+                } else if event.id == tray_ids.enabled {
+                    pa.set_bypass(!pa.bypass());
+                } else if event.id == tray_ids.quit {
+                    let _ = control_tx.send(Control::Quit);
+                    break;
+                } else {
+                    log::debug!("Unrecognized event: {event:?}");
+                }
+            }
+            log::debug!("Tray thread exited");
+        }
+    });
+
+    while window_rx.recv().is_ok() {
+        window_open.store(true, Ordering::Relaxed);
+        eframe::run_native(
+            "Upalla",
+            options.clone(),
+            Box::new({
+                let pa = pa.clone();
+                let status_rx = status_rx.clone();
+                let control_rx = control_rx.clone();
+                move |_cc| Ok(Box::new(UpallaApp::new(pa, status_rx, control_rx)))
+            }),
+        )?;
+        window_open.store(false, Ordering::Relaxed);
+    }
+
+    log::debug!("eframe exited -- quitting");
+    pa.shutdown();
 
     Ok(())
 }
