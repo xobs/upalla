@@ -8,6 +8,7 @@ description = "GUI for Upalla noise suppression"
 [dependencies]
 upalla-core = { path = "../upalla-core" }
 upalla-pa = { path = "../upalla-pa" }
+ctrlc = "3"
 eframe = { version = "0.34", default-features = false, features = [
     "wayland",
     "wgpu",

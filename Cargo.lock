@@ -4233,6 +4233,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "ctrlc",
  "eframe",
  "egui",
  "env_logger",

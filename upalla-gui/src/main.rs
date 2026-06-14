@@ -33,6 +33,9 @@ struct UpallaApp {
 }
 
 enum Control {
+    /// Open a new window
+    Open,
+    /// Quit the program
     Quit,
 }
 
@@ -162,6 +165,21 @@ fn main() -> Result<()> {
     let window_open = Arc::new(AtomicBool::new(false));
     let (window_tx, window_rx) = crossbeam_channel::bounded(1);
     let (control_tx, control_rx) = crossbeam_channel::bounded(1);
+
+    ctrlc::set_handler({
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let control_tx = control_tx.clone();
+        let window_tx = window_tx.clone();
+        move || {
+            if !shutting_down.swap(true, Ordering::SeqCst) {
+                println!("Ctrl-C pressed, shutting down");
+                let _ = control_tx.try_send(Control::Quit);
+                let _ = window_tx.try_send(Control::Quit);
+            }
+        }
+    })
+    .context("ctrlc")?;
+
     // Poll tray menu events
     std::thread::spawn({
         let pa = Arc::clone(&pa);
@@ -170,7 +188,7 @@ fn main() -> Result<()> {
             while let Ok(event) = tray_icon::menu::MenuEvent::receiver().recv() {
                 if event.id == tray_ids.show_hide && window_tx.is_empty() {
                     if !window_open.load(Ordering::Relaxed) {
-                        let _ = window_tx.send(());
+                        let _ = window_tx.send(Control::Open);
                     }
                 } else if event.id == tray_ids.enabled {
                     pa.set_bypass(!pa.bypass());
@@ -185,7 +203,7 @@ fn main() -> Result<()> {
         }
     });
 
-    while window_rx.recv().is_ok() {
+    while let Ok(Control::Open) = window_rx.recv() {
         window_open.store(true, Ordering::Relaxed);
         eframe::run_native(
             "Upalla",

@@ -320,7 +320,7 @@ pub fn run_filter(
     registered_modules.sink = NonZeroU32::new(sink_module_id);
 
     let src_sink_args = format!(
-        "sink_name={0} sink_properties=\"device.description='Upalla Denoised Input Monitor' device.class='filter' device.profile.description='Denoised Input Monitor'\"",
+        "sink_name={0} sink_properties=\"device.description='Upalla Denoised Input Monitor' device.class='filter' state.ignore=true device.profile.description='Denoised Input Monitor'\"",
         SRC_SINK_NAME
     );
     let source_module = Rc::new(RefCell::new(0u32));
@@ -370,11 +370,11 @@ pub fn run_filter(
         tlength: u32::MAX,
         prebuf: u32::MAX,
         minreq: u32::MAX,
-        fragsize: 48,
+        fragsize: 50,
     });
     let playback_attr = Some(BufferAttr {
         maxlength: u32::MAX,
-        tlength: 48,
+        tlength: 50,
         prebuf: u32::MAX,
         minreq: u32::MAX,
         fragsize: u32::MAX,
