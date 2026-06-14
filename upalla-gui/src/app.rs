@@ -40,7 +40,7 @@ impl AppGuiState {
                 self.show_window = true;
             }
         } else if event.id == ids.enabled {
-            self.pending_actions.push(TrayAction::SetEnabled(true));
+            self.pending_actions.push(TrayAction::ToggleEnabled);
         } else if event.id == ids.quit {
             self.pending_actions.push(TrayAction::Quit);
         }
@@ -55,15 +55,13 @@ impl AppGuiState {
         }
     }
 
-    pub fn drain_actions(&mut self) -> Vec<TrayAction> {
+    pub fn drain_pending_actions(&mut self) -> Vec<TrayAction> {
         std::mem::take(&mut self.pending_actions)
     }
 }
 
 #[allow(deprecated)]
-pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) -> Vec<TrayAction> {
-    let actions = state.drain_actions();
-
+pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
     egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
         ui.heading("Upalla");
         ui.separator();
@@ -82,7 +80,10 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) -> Vec<TrayActio
         });
 
         ui.add_space(4.0);
-        ui.checkbox(&mut state.bypass, "Bypass");
+        let mut enabled = !state.bypass;
+        if ui.checkbox(&mut enabled, "Enabled").changed() {
+            state.bypass = !enabled;
+        }
 
         ui.add_space(8.0);
         ui.separator();
@@ -121,6 +122,4 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) -> Vec<TrayActio
             );
         });
     });
-
-    actions
 }

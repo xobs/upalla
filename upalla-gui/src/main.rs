@@ -15,7 +15,7 @@ mod tray;
 pub enum TrayAction {
     Show,
     Hide,
-    SetEnabled(bool),
+    ToggleEnabled,
     Quit,
 }
 
@@ -24,6 +24,7 @@ struct UpallaApp {
     gui_state: app::AppGuiState,
     status_rx: Receiver<upalla_pa::Status>,
     tray_done: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
 }
 
 impl UpallaApp {
@@ -32,32 +33,31 @@ impl UpallaApp {
         status_rx: Receiver<upalla_pa::Status>,
         tray_done: Arc<AtomicBool>,
         tray_ids: Option<tray::TrayMenuIds>,
+        enabled: Arc<AtomicBool>,
     ) -> Self {
         UpallaApp {
             pa,
             gui_state: app::AppGuiState::new(tray_ids),
             status_rx,
             tray_done,
+            enabled,
         }
     }
 }
 
 impl eframe::App for UpallaApp {
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        log::debug!("eframe::App::ui()");
-    }
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        log::debug!("eframe::App::update()");
-        // Hide window on first frame — go to tray
         if self.gui_state.start_hidden() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            ctx.request_repaint();
-            return;
         }
 
+        // Sync enabled state into the GUI so the checkbox is correct
+        self.gui_state.bypass = !self.enabled.load(Ordering::Relaxed);
+
         // Poll tray menu events
-        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             self.gui_state.handle_tray_event(event);
         }
 
@@ -67,24 +67,23 @@ impl eframe::App for UpallaApp {
             self.gui_state.rms_out = status.rms_out;
         }
 
-        // Render GUI
-        let actions = app::render_gui(ctx, &mut self.gui_state);
-
-        // Handle tray actions
-        for action in actions {
-            log::debug!("Tray Action: {action:?}");
+        // Process tray actions BEFORE rendering so the GUI reflects them
+        for action in self.gui_state.drain_pending_actions() {
             match action {
                 TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
-                        400.0, 320.0,
-                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        egui::Vec2::new(400.0, 320.0),
+                    ));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 }
                 TrayAction::Hide => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 }
-                TrayAction::SetEnabled(enabled) => {
-                    self.pa.set_bypass(!enabled);
+                TrayAction::ToggleEnabled => {
+                    let was = self.enabled.load(Ordering::Relaxed);
+                    self.enabled.store(!was, Ordering::Relaxed);
+                    self.gui_state.bypass = was;
+                    self.pa.set_bypass(was);
                 }
                 TrayAction::Quit => {
                     self.tray_done.store(true, Ordering::Relaxed);
@@ -93,13 +92,18 @@ impl eframe::App for UpallaApp {
             }
         }
 
-        // Sync bypass state
+        // Render GUI (now with up-to-date enabled/bypass state)
+        app::render_gui(ctx, &mut self.gui_state);
+
+        // Sync GUI checkbox back to enabled, then to PA
+        let gui_enabled = !self.gui_state.bypass;
+        if gui_enabled != self.enabled.load(Ordering::Relaxed) {
+            self.enabled.store(gui_enabled, Ordering::Relaxed);
+        }
         self.pa.set_bypass(self.gui_state.bypass);
 
-        // Throttle when minimized
-        if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
-        }
+        // Always request repaints so tray events are polled even when minimized
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 }
 
@@ -111,13 +115,15 @@ fn main() -> Result<()> {
     let status_rx = pa.status_receiver().clone();
 
     let tray_done = Arc::new(AtomicBool::new(false));
+    let enabled = Arc::new(AtomicBool::new(true));
     let (ids_tx, ids_rx) = crossbeam_channel::bounded(1);
 
     let _tray_handle = {
         let done = tray_done.clone();
+        let en = enabled.clone();
         thread::Builder::new()
             .name("upalla-tray".into())
-            .spawn(move || tray::run_tray(done, ids_tx))
+            .spawn(move || tray::run_tray(done, ids_tx, en))
             .expect("spawn tray")
     };
 
@@ -133,7 +139,15 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Upalla",
         options,
-        Box::new(move |_cc| Ok(Box::new(UpallaApp::new(pa, status_rx, tray_done, tray_ids)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(UpallaApp::new(
+                pa,
+                status_rx,
+                tray_done,
+                tray_ids,
+                enabled,
+            )))
+        }),
     )?;
 
     Ok(())
