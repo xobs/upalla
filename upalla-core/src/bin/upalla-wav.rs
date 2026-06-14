@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use df::tract::{DfParams, DfTract, ReduceMask, RuntimeParams};
-use ndarray::Array2;
+use upalla_core::denoiser::{Denoiser, StereoChunk, CHUNK};
+use upalla_core::model::Model;
 
 #[derive(Parser)]
 struct Args {
@@ -16,6 +16,9 @@ struct Args {
 
     #[arg(long, default_value_t = 0.02)]
     post_filter_beta: f32,
+
+    #[arg(long)]
+    model: Option<PathBuf>,
 
     input_file: PathBuf,
     output_file: PathBuf,
@@ -29,45 +32,33 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     log::info!("Loading model...");
-    let params = DfParams::default();
-    let rp = RuntimeParams::default_with_ch(2)
-        .with_atten_lim(args.atten_lim_db)
-        .with_thresholds(-15.0, 35.0, 35.0)
-        .with_mask_reduce(ReduceMask::MAX);
-    let mut model = DfTract::new(params, &rp)?;
-    if args.post_filter {
-        model.set_pf_beta(args.post_filter_beta);
-    }
+    let model = match &args.model {
+        Some(path) => Model::Custom(path.clone()),
+        None => Model::default(),
+    };
+    let mut denoiser = Denoiser::new(&model, 2)?;
 
     log::info!("Reading {}", args.input_file.display());
     let (left, right, sr) = upalla_core::wav::read_wav_stereo(&args.input_file)?;
     let n = left.len();
-    let hop = model.hop_size;
-    let n_frames = n / hop;
-    let n_pad = n_frames * hop;
+    let n_frames = n / CHUNK;
+    let n_pad = n_frames * CHUNK;
 
     let mut enhanced_left = vec![0.0f32; n_pad];
     let mut enhanced_right = vec![0.0f32; n_pad];
 
     let t0 = Instant::now();
     for i in 0..n_frames {
-        let start = i * hop;
-        let end = start + hop;
+        let start = i * CHUNK;
+        let end = start + CHUNK;
 
-        let mut frame = Array2::<f32>::zeros((2, hop));
-        frame.row_mut(0).as_slice_mut().unwrap().copy_from_slice(&left[start..end]);
-        frame.row_mut(1).as_slice_mut().unwrap().copy_from_slice(&right[start..end]);
+        let mut sc = StereoChunk { left: [0.0; CHUNK], right: [0.0; CHUNK] };
+        sc.left.copy_from_slice(&left[start..end]);
+        sc.right.copy_from_slice(&right[start..end]);
 
-        let noisy_view = frame.view();
-        let mut enhanced = Array2::<f32>::zeros((2, hop));
-        let mut enh_view = enhanced.view_mut();
-
-        model.process(noisy_view, enh_view)?;
-
-        enhanced_left[start..end]
-            .copy_from_slice(enhanced.row(0).as_slice().unwrap());
-        enhanced_right[start..end]
-            .copy_from_slice(enhanced.row(1).as_slice().unwrap());
+        let out = denoiser.process_stereo(&sc)?;
+        enhanced_left[start..end].copy_from_slice(&out.left);
+        enhanced_right[start..end].copy_from_slice(&out.right);
     }
 
     let elapsed = t0.elapsed().as_secs_f32();

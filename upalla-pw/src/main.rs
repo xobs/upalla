@@ -5,7 +5,6 @@ mod pw_ffi;
 
 use crate::pw_ffi::*;
 use std::ffi::{c_void, CString};
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -15,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossbeam_queue::ArrayQueue;
 use upalla_core::denoiser::{Denoiser, StereoChunk, CHUNK};
+use upalla_core::model::Model;
 
 const QCAP: usize = 64;
 
@@ -22,19 +22,6 @@ static PW_API: OnceLock<PwApi> = OnceLock::new();
 static mut QUIT_LOOP: *mut c_void = ptr::null_mut();
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
-fn find_model_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let dir = PathBuf::from(&home).join(".local/share/upalla");
-    if has_model(&dir) { return Some(dir); }
-    for p in &["/usr/local/share/upalla", "/usr/share/upalla"] {
-        let d = PathBuf::from(p);
-        if has_model(&d) { return Some(d); }
-    }
-    None
-}
-fn has_model(dir: &PathBuf) -> bool {
-    dir.join("enc.onnx").exists() && dir.join("erb_dec.onnx").exists() && dir.join("df_dec.onnx").exists()
-}
 fn to_c(s: &str) -> CString { CString::new(s).unwrap() }
 
 // Worker thread: runs denoiser off the RT audio thread.
@@ -47,8 +34,7 @@ struct Worker {
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
-    fn new(model_dir: &PathBuf) -> Self {
-        let model_dir = model_dir.clone();
+    fn new(model: Model) -> Self {
         let in_q: Arc<ArrayQueue<StereoChunk>> = Arc::new(ArrayQueue::new(QCAP));
         let out_q: Arc<ArrayQueue<StereoChunk>> = Arc::new(ArrayQueue::new(QCAP));
         let done = Arc::new(AtomicBool::new(false));
@@ -56,7 +42,7 @@ impl Worker {
         let iq = in_q.clone(); let oq = out_q.clone();
         let d = done.clone(); let r = reset_flag.clone();
         let thread = thread::Builder::new().name("upalla-worker".into()).spawn(move || {
-            let mut denoiser = match Denoiser::new(&model_dir, 2) {
+            let mut denoiser = match Denoiser::new(&model, 2) {
                 Ok(d) => d,
                 Err(e) => { log::error!("Failed to create denoiser: {e}"); return; }
             };
@@ -208,10 +194,8 @@ fn main() -> Result<()> {
     let worker = if passthrough {
         None
     } else {
-        let model_dir = find_model_dir()
-            .context("ONNX model not found. Run: ./scripts/download-model.sh\nOr: upalla --passthrough")?;
-        log::info!("Loading model from {:?}", model_dir);
-        Some(Worker::new(&model_dir))
+        log::info!("Loading model...");
+        Some(Worker::new(Model::default()))
     };
 
     PW_API.set(api).map_err(|_| anyhow::anyhow!("API"))?;

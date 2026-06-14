@@ -1,0 +1,24 @@
+[package]
+name = "upalla-gui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "GUI for Upalla noise suppression"
+
+[dependencies]
+upalla-core = { path = "../upalla-core" }
+upalla-pa = { path = "../upalla-pa" }
+eframe = { version = "0.34", default-features = false, features = [
+    "wayland",
+    "wgpu",
+    "default_fonts",
+] }
+egui = "0.34"
+tray-icon = { version = "0.19", default-features = false }
+crossbeam-channel = "0.5"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
