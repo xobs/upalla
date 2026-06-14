@@ -2668,6 +2668,7 @@ name = "upalla-pa"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ctrlc",
  "env_logger",
  "libpulse-binding",
  "log",

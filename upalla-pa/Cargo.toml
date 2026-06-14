@@ -10,8 +10,9 @@ name = "upalla-pa"
 path = "src/main.rs"
 
 [dependencies]
-upalla-core = { path = "../upalla-core" }
-libpulse-binding = "2.30"
 anyhow = "1"
-log = "0.4"
+ctrlc = "3"
 env_logger = "0.11"
+libpulse-binding = "2.30"
+log = "0.4"
+upalla-core = { path = "../upalla-core" }

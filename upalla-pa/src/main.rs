@@ -6,8 +6,10 @@
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use libpulse_binding as pulse;
 use pulse::context::{Context, FlagSet as CtxFlags};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
@@ -191,6 +193,17 @@ fn main() -> Result<()> {
     let mut src_out = AudioBuf::new();
     let frame_size = CHUNK * 2;
 
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let shutting_down = Arc::clone(&shutting_down);
+        move || {
+            if !shutting_down.swap(true, Ordering::SeqCst) {
+                println!("Ctrl-C pressed, shutting down");
+            }
+        }
+    })
+    .context("ctrlc")?;
+
     loop {
         pump_read(&mut sink_rec, &mut sink_in);
         pump_read(&mut src_rec, &mut src_in);
@@ -242,6 +255,10 @@ fn main() -> Result<()> {
         {
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
+
+        if shutting_down.load(Ordering::Relaxed) {
+            mainloop.quit(libpulse_binding::def::Retval(0));
+        }
     }
 
     log::info!("Cleaning up...");
@@ -250,12 +267,15 @@ fn main() -> Result<()> {
     drop(src_rec);
     drop(src_play);
     if *sink_module.borrow() != 0 {
+        log::debug!("Unloading sink module 0x{:x}", *sink_module.borrow());
         unload_module(*sink_module.borrow());
     }
     if *source_module.borrow() != 0 {
+        log::debug!("Unloading source module 0x{:x}", *source_module.borrow());
         unload_module(*source_module.borrow());
     }
     if *remap_module.borrow() != 0 {
+        log::debug!("Unloading remap module 0x{:x}", *remap_module.borrow());
         unload_module(*remap_module.borrow());
     }
     context.disconnect();
