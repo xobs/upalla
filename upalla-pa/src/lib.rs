@@ -7,8 +7,8 @@ use upalla_core::model::Model;
 
 mod filter;
 
-pub use filter::{DeviceInfo, DeviceLists, Status};
 use filter::Cmd;
+pub use filter::{DeviceInfo, DeviceLists, Status};
 
 pub struct PaFilter {
     cmd_tx: Sender<Cmd>,
@@ -70,13 +70,23 @@ impl PaFilter {
     pub fn status_receiver(&self) -> &Receiver<Status> {
         &self.status_rx
     }
+
+    pub fn shutdown(&mut self) -> bool {
+        let _ = self.cmd_tx.send(Cmd::Shutdown);
+        let Some(h) = self.handle.take() else {
+            return false;
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !h.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        h.is_finished() && h.join().is_ok()
+    }
 }
 
 impl Drop for PaFilter {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(Cmd::Shutdown);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.shutdown();
     }
 }

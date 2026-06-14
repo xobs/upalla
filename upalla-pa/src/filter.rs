@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
 use libpulse_binding as pulse;
-use libpulse_binding::def::BufferAttr;
+use libpulse_binding::def::{BufferAttr, Retval};
 use pulse::context::{Context, FlagSet as CtxFlags};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::stream::{FlagSet as StreamFlags, PeekResult, Stream};
@@ -218,9 +218,7 @@ fn enumerate_devices(mainloop: &mut Mainloop, context: &Context) -> DeviceLists 
     let sinks = collect_list(mainloop, context, |intro, l, d| {
         intro.get_sink_info_list(move |result| match result {
             ListResult::Item(info) => {
-                if let (Some(name), Some(desc)) =
-                    (info.name.as_ref(), info.description.as_ref())
-                {
+                if let (Some(name), Some(desc)) = (info.name.as_ref(), info.description.as_ref()) {
                     l.borrow_mut().push(DeviceInfo {
                         name: name.to_string(),
                         description: desc.to_string(),
@@ -235,9 +233,7 @@ fn enumerate_devices(mainloop: &mut Mainloop, context: &Context) -> DeviceLists 
     let sources = collect_list(mainloop, context, |intro, l, d| {
         intro.get_source_info_list(move |result| match result {
             ListResult::Item(info) => {
-                if let (Some(name), Some(desc)) =
-                    (info.name.as_ref(), info.description.as_ref())
-                {
+                if let (Some(name), Some(desc)) = (info.name.as_ref(), info.description.as_ref()) {
                     l.borrow_mut().push(DeviceInfo {
                         name: name.to_string(),
                         description: desc.to_string(),
@@ -390,8 +386,7 @@ pub fn run_filter(
         recv_flags,
     )?;
 
-    let mut sink_play =
-        Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
+    let mut sink_play = Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
     let mut sink_play_dest = "@DEFAULT_SINK@".to_string();
     sink_play.connect_playback(
         Some(&sink_play_dest),
@@ -405,8 +400,7 @@ pub fn run_filter(
     let mut src_rec_source = "@DEFAULT_SOURCE@".to_string();
     src_rec.connect_record(Some(&src_rec_source), record_attr.as_ref(), recv_flags)?;
 
-    let mut src_play =
-        Stream::new(&mut context, "src-play", &spec, None).context("src play")?;
+    let mut src_play = Stream::new(&mut context, "src-play", &spec, None).context("src play")?;
     src_play.connect_playback(
         Some(SRC_SINK_NAME),
         playback_attr.as_ref(),
@@ -446,8 +440,7 @@ pub fn run_filter(
                     sink_play_dest = name;
                     drop(std::mem::replace(
                         &mut sink_play,
-                        Stream::new(&mut context, "sink-play", &spec, None)
-                            .context("sink play")?,
+                        Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?,
                     ));
                     sink_play.connect_playback(
                         Some(&sink_play_dest),
@@ -464,8 +457,7 @@ pub fn run_filter(
                     src_rec_source = name;
                     drop(std::mem::replace(
                         &mut src_rec,
-                        Stream::new(&mut context, "src-rec", &spec, None)
-                            .context("src rec")?,
+                        Stream::new(&mut context, "src-rec", &spec, None).context("src rec")?,
                     ));
                     src_rec.connect_record(
                         Some(&src_rec_source),
@@ -477,7 +469,7 @@ pub fn run_filter(
                 }
                 Cmd::Shutdown => {
                     log::info!("PA filter received shutdown command");
-                    break;
+                    mainloop.quit(Retval(0));
                 }
             }
         }
@@ -552,10 +544,7 @@ pub fn run_filter(
             } else {
                 (0.0, 0.0)
             };
-            let _ = status_tx.try_send(Status {
-                rms_in,
-                rms_out,
-            });
+            let _ = status_tx.try_send(Status { rms_in, rms_out });
             rms_accum = [0.0; 4];
             rms_count = 0;
             last_status = Instant::now();
@@ -581,6 +570,7 @@ pub fn run_filter(
     drop(src_play);
 
     context.disconnect();
+
     log::info!("Upalla PA filter stopped.");
     Ok(())
 }

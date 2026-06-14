@@ -56,6 +56,13 @@ impl eframe::App for UpallaApp {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // When the user closes the window, just hide to tray
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
+        // Hide window on first frame — go to tray
         if self.gui_state.start_hidden() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
@@ -83,17 +90,16 @@ impl eframe::App for UpallaApp {
         // Device refresh
         if self.gui_state.refresh_devices {
             self.gui_state.refresh_devices = false;
-            self.gui_state
-                .set_devices(self.pa.enumerate_devices());
+            self.gui_state.set_devices(self.pa.enumerate_devices());
         }
 
         // Process tray actions BEFORE rendering so the GUI reflects them
         for action in self.gui_state.drain_pending_actions() {
             match action {
                 TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                        egui::Vec2::new(400.0, 320.0),
-                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                        400.0, 320.0,
+                    )));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 }
                 TrayAction::Hide => {
@@ -106,7 +112,9 @@ impl eframe::App for UpallaApp {
                     self.pa.set_bypass(was);
                 }
                 TrayAction::Quit => {
+                    log::debug!("Quit event received -- cleaning up");
                     self.tray_done.store(true, Ordering::Relaxed);
+                    self.pa.shutdown();
                     std::process::exit(0);
                 }
             }
@@ -122,8 +130,7 @@ impl eframe::App for UpallaApp {
         }
         if self.gui_state.selected_source != self.prev_source {
             self.prev_source = self.gui_state.selected_source.clone();
-            self.pa
-                .set_source(self.gui_state.selected_source.clone());
+            self.pa.set_source(self.gui_state.selected_source.clone());
         }
 
         // Sync GUI checkbox back to enabled, then to PA
@@ -172,11 +179,7 @@ fn main() -> Result<()> {
         options,
         Box::new(move |_cc| {
             Ok(Box::new(UpallaApp::new(
-                pa,
-                status_rx,
-                tray_done,
-                tray_ids,
-                enabled,
+                pa, status_rx, tray_done, tray_ids, enabled,
             )))
         }),
     )?;
