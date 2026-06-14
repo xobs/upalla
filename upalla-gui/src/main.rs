@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
@@ -27,6 +28,7 @@ struct UpallaApp {
     enabled: Arc<AtomicBool>,
     prev_sink: String,
     prev_source: String,
+    last_device_refresh: Instant,
 }
 
 impl UpallaApp {
@@ -45,6 +47,7 @@ impl UpallaApp {
             enabled,
             prev_sink: String::new(),
             prev_source: String::new(),
+            last_device_refresh: Instant::now(),
         }
     }
 }
@@ -69,6 +72,12 @@ impl eframe::App for UpallaApp {
         while let Ok(status) = self.status_rx.try_recv() {
             self.gui_state.rms_in = status.rms_in;
             self.gui_state.rms_out = status.rms_out;
+        }
+
+        // Auto-refresh device list roughly once per second
+        if self.last_device_refresh.elapsed() >= std::time::Duration::from_secs(1) {
+            self.gui_state.refresh_devices = true;
+            self.last_device_refresh = Instant::now();
         }
 
         // Device refresh

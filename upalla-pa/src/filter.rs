@@ -279,6 +279,9 @@ where
         mainloop.iterate(true);
     }
     list.take()
+        .into_iter()
+        .filter(|d| !d.name.contains("upalla"))
+        .collect()
 }
 
 pub fn run_filter(

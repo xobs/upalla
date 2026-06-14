@@ -17,8 +17,8 @@ pub struct AppGuiState {
 
     sinks: Vec<DeviceInfo>,
     sources: Vec<DeviceInfo>,
-    default_sink_name: String,
-    default_source_name: String,
+    default_sink_display: String,
+    default_source_display: String,
     pub selected_sink: String,
     pub selected_source: String,
     pub refresh_devices: bool,
@@ -37,8 +37,8 @@ impl AppGuiState {
             pending_actions: Vec::new(),
             sinks: Vec::new(),
             sources: Vec::new(),
-            default_sink_name: String::new(),
-            default_source_name: String::new(),
+            default_sink_display: String::new(),
+            default_source_display: String::new(),
             selected_sink: String::new(),
             selected_source: String::new(),
             refresh_devices: true,
@@ -80,8 +80,18 @@ impl AppGuiState {
     pub fn set_devices(&mut self, lists: DeviceLists) {
         self.sinks = lists.sinks;
         self.sources = lists.sources;
-        self.default_sink_name = lists.default_sink;
-        self.default_source_name = lists.default_source;
+        self.default_sink_display = self
+            .sinks
+            .iter()
+            .find(|d| d.name == lists.default_sink)
+            .map(|d| d.description.clone())
+            .unwrap_or(lists.default_sink);
+        self.default_source_display = self
+            .sources
+            .iter()
+            .find(|d| d.name == lists.default_source)
+            .map(|d| d.description.clone())
+            .unwrap_or(lists.default_source);
         if self.selected_sink.is_empty() {
             self.selected_sink = "@DEFAULT_SINK@".into();
         }
@@ -146,7 +156,7 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
                 "output_sink",
                 &state.sinks,
                 "@DEFAULT_SINK@",
-                &state.default_sink_name,
+                &state.default_sink_display,
                 &mut state.selected_sink,
             );
             if ui.button("\u{21bb}").clicked() {
@@ -163,7 +173,7 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
                 "input_source",
                 &state.sources,
                 "@DEFAULT_SOURCE@",
-                &state.default_source_name,
+                &state.default_source_display,
                 &mut state.selected_source,
             );
             if ui.button("\u{21bb}").clicked() {
