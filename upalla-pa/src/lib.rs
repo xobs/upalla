@@ -72,6 +72,10 @@ impl PaFilter {
         let _ = self.cmd_tx.send(Cmd::SetSource(name));
     }
 
+    pub fn set_buffer_ms(&self, ms: u32) {
+        let _ = self.cmd_tx.send(Cmd::SetBufferMs(ms));
+    }
+
     pub fn status_receiver(&self) -> &Receiver<Status> {
         &self.status_rx
     }
