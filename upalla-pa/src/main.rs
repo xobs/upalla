@@ -4,6 +4,7 @@
 //! Source path: @DEFAULT_SOURCE@ → capture → denoise → upalla_src_sink → upalla_virtual → apps
 
 use std::cell::RefCell;
+use std::num::NonZeroU32;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use libpulse_binding as pulse;
+use libpulse_binding::def::BufferAttr;
 use pulse::context::{Context, FlagSet as CtxFlags};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::stream::{FlagSet as StreamFlags, PeekResult, Stream};
@@ -93,9 +95,35 @@ fn unload_module(idx: u32) {
         .output();
 }
 
+#[derive(Default)]
+struct RegisteredModules {
+    sink: Option<NonZeroU32>,
+    source: Option<NonZeroU32>,
+    remap: Option<NonZeroU32>,
+}
+
+impl Drop for RegisteredModules {
+    fn drop(&mut self) {
+        if let Some(sink) = self.sink.take().map(|s| s.get()) {
+            log::debug!("Unloading sink module {sink}");
+            unload_module(sink);
+        }
+        if let Some(source) = self.source.take().map(|s| s.get()) {
+            log::debug!("Unloading source module {source}");
+            unload_module(source);
+        }
+        if let Some(remap) = self.remap.take().map(|s| s.get()) {
+            log::debug!("Unloading remap module {remap}");
+            unload_module(remap);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     log::info!("Upalla PulseAudio filter starting...");
+    let mut registered_modules = RegisteredModules::default();
+
     cleanup_stale_modules();
 
     let mut mainloop = Mainloop::new().expect("PA mainloop");
@@ -123,7 +151,9 @@ fn main() -> Result<()> {
     while *sink_module.borrow() == 0 {
         mainloop.iterate(true);
     }
-    log::info!("Output sink loaded (idx={})", sink_module.borrow());
+    let sink_module = *sink_module.borrow();
+    log::info!("Output sink loaded (idx={sink_module})");
+    registered_modules.sink = NonZeroU32::new(sink_module);
 
     // Internal sink for source path audio routing
     let src_sink_args = format!(
@@ -141,7 +171,9 @@ fn main() -> Result<()> {
     while *source_module.borrow() == 0 {
         mainloop.iterate(true);
     }
-    log::info!("Source sink loaded (idx={})", source_module.borrow());
+    let source_module = *source_module.borrow();
+    log::info!("Source sink loaded (idx={source_module})");
+    registered_modules.source = NonZeroU32::new(source_module);
 
     // Remap-source: exposes the source sink's monitor as a proper recording device
     let remap_args = format!(
@@ -160,28 +192,69 @@ fn main() -> Result<()> {
     while *remap_module.borrow() == 0 {
         mainloop.iterate(true);
     }
-    log::info!("Remap source loaded (idx={})", remap_module.borrow());
+    let remap_module = *remap_module.borrow();
+    log::info!("Remap source loaded (idx={remap_module})");
+    registered_modules.remap = NonZeroU32::new(remap_module);
 
     let spec = pulse::sample::Spec {
         format: pulse::sample::Format::F32le,
         rate: 48000,
         channels: 2,
     };
-    let flags = StreamFlags::ADJUST_LATENCY | StreamFlags::AUTO_TIMING_UPDATE;
+    let recv_flags = StreamFlags::ADJUST_LATENCY | StreamFlags::AUTO_TIMING_UPDATE;
+    let play_flags = StreamFlags::ADJUST_LATENCY | StreamFlags::AUTO_TIMING_UPDATE;
+    let record_attr = Some(BufferAttr {
+        maxlength: u32::MAX,
+        tlength: u32::MAX,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: 48,
+    });
+    let playback_attr = Some(BufferAttr {
+        maxlength: u32::MAX,
+        tlength: 48,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: u32::MAX,
+    });
 
     // Sink path: capture from output sink monitor → denoise → play to real sink
     let mut sink_rec = Stream::new(&mut context, "sink-rec", &spec, None).expect("sink rec");
-    sink_rec.connect_record(Some(&format!("{}.monitor", SINK_NAME)), None, flags)?;
+    log::debug!("Connecting playback to denoise...");
+    sink_rec.connect_record(
+        Some(&format!("{}.monitor", SINK_NAME)),
+        record_attr.as_ref(),
+        recv_flags,
+    )?;
+    log::debug!("sink_rec buffer_addr: {:?}", sink_rec.get_buffer_attr());
 
     let mut sink_play = Stream::new(&mut context, "sink-play", &spec, None).expect("sink play");
-    sink_play.connect_playback(Some("@DEFAULT_SINK@"), None, flags, None, None)?;
+    log::debug!("Connecting denoise to playback...");
+    sink_play.connect_playback(
+        Some("@DEFAULT_SINK@"),
+        playback_attr.as_ref(),
+        play_flags,
+        None,
+        None,
+    )?;
+    log::debug!("sink_play buffer_addr: {:?}", sink_play.get_buffer_attr());
 
     // Source path: capture from real mic → denoise → play to internal sink
     let mut src_rec = Stream::new(&mut context, "src-rec", &spec, None).expect("src rec");
-    src_rec.connect_record(Some("@DEFAULT_SOURCE@"), None, flags)?;
+    log::debug!("Connecting record to denoise...");
+    src_rec.connect_record(Some("@DEFAULT_SOURCE@"), record_attr.as_ref(), recv_flags)?;
+    log::debug!("src_rec buffer_addr: {:?}", src_rec.get_buffer_attr());
 
     let mut src_play = Stream::new(&mut context, "src-play", &spec, None).expect("src play");
-    src_play.connect_playback(Some(SRC_SINK_NAME), None, flags, None, None)?;
+    log::debug!("Connecting denoise to record...");
+    src_play.connect_playback(
+        Some(SRC_SINK_NAME),
+        playback_attr.as_ref(),
+        play_flags,
+        None,
+        None,
+    )?;
+    log::debug!("src_play buffer_addr: {:?}", src_play.get_buffer_attr());
 
     log::info!("Streams connected. Processing...");
 
@@ -266,18 +339,7 @@ fn main() -> Result<()> {
     drop(sink_play);
     drop(src_rec);
     drop(src_play);
-    if *sink_module.borrow() != 0 {
-        log::debug!("Unloading sink module 0x{:x}", *sink_module.borrow());
-        unload_module(*sink_module.borrow());
-    }
-    if *source_module.borrow() != 0 {
-        log::debug!("Unloading source module 0x{:x}", *source_module.borrow());
-        unload_module(*source_module.borrow());
-    }
-    if *remap_module.borrow() != 0 {
-        log::debug!("Unloading remap module 0x{:x}", *remap_module.borrow());
-        unload_module(*remap_module.borrow());
-    }
+
     context.disconnect();
     log::info!("Upalla PA filter stopped.");
     Ok(())
