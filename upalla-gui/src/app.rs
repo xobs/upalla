@@ -1,3 +1,6 @@
+use upalla_pa::DeviceInfo;
+use upalla_pa::DeviceLists;
+
 use crate::tray::TrayMenuIds;
 use crate::TrayAction;
 
@@ -11,6 +14,14 @@ pub struct AppGuiState {
     show_window: bool,
     start_hidden: bool,
     pending_actions: Vec<TrayAction>,
+
+    sinks: Vec<DeviceInfo>,
+    sources: Vec<DeviceInfo>,
+    default_sink_name: String,
+    default_source_name: String,
+    pub selected_sink: String,
+    pub selected_source: String,
+    pub refresh_devices: bool,
 }
 
 impl AppGuiState {
@@ -24,6 +35,13 @@ impl AppGuiState {
             show_window: false,
             start_hidden: true,
             pending_actions: Vec::new(),
+            sinks: Vec::new(),
+            sources: Vec::new(),
+            default_sink_name: String::new(),
+            default_source_name: String::new(),
+            selected_sink: String::new(),
+            selected_source: String::new(),
+            refresh_devices: true,
         }
     }
 
@@ -58,6 +76,57 @@ impl AppGuiState {
     pub fn drain_pending_actions(&mut self) -> Vec<TrayAction> {
         std::mem::take(&mut self.pending_actions)
     }
+
+    pub fn set_devices(&mut self, lists: DeviceLists) {
+        self.sinks = lists.sinks;
+        self.sources = lists.sources;
+        self.default_sink_name = lists.default_sink;
+        self.default_source_name = lists.default_source;
+        if self.selected_sink.is_empty() {
+            self.selected_sink = "@DEFAULT_SINK@".into();
+        }
+        if self.selected_source.is_empty() {
+            self.selected_source = "@DEFAULT_SOURCE@".into();
+        }
+    }
+}
+
+fn device_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    devices: &[DeviceInfo],
+    default_alias: &str,
+    default_name: &str,
+    selected: &mut String,
+) {
+    let default_label = format!("Default ({})", default_name);
+    let mut entries: Vec<(String, String)> = vec![(default_alias.into(), default_label)];
+    for d in devices {
+        entries.push((d.name.clone(), d.description.clone()));
+    }
+
+    let mut selected_idx = entries
+        .iter()
+        .position(|(name, _)| name == selected.as_str())
+        .unwrap_or(0);
+
+    let display_text = entries
+        .get(selected_idx)
+        .map(|(_, desc)| desc.as_str())
+        .unwrap_or("");
+
+    egui::ComboBox::from_id_salt(label)
+        .width(200.0)
+        .selected_text(display_text)
+        .show_ui(ui, |ui| {
+            for (i, (_, desc)) in entries.iter().enumerate() {
+                ui.selectable_value(&mut selected_idx, i, desc);
+            }
+        });
+
+    if selected_idx < entries.len() {
+        *selected = entries[selected_idx].0.clone();
+    }
 }
 
 #[allow(deprecated)]
@@ -69,6 +138,40 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
 
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Output:");
+            device_combo(
+                ui,
+                "output_sink",
+                &state.sinks,
+                "@DEFAULT_SINK@",
+                &state.default_sink_name,
+                &mut state.selected_sink,
+            );
+            if ui.button("\u{21bb}").clicked() {
+                state.refresh_devices = true;
+            }
+        });
+
+        ui.add_space(2.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Input: ");
+            device_combo(
+                ui,
+                "input_source",
+                &state.sources,
+                "@DEFAULT_SOURCE@",
+                &state.default_source_name,
+                &mut state.selected_source,
+            );
+            if ui.button("\u{21bb}").clicked() {
+                state.refresh_devices = true;
+            }
+        });
+
+        ui.add_space(6.0);
 
         ui.horizontal(|ui| {
             ui.label("Buffer:");

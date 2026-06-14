@@ -7,7 +7,7 @@ use upalla_core::model::Model;
 
 mod filter;
 
-pub use filter::Status;
+pub use filter::{DeviceInfo, DeviceLists, Status};
 use filter::Cmd;
 
 pub struct PaFilter {
@@ -46,6 +46,25 @@ impl PaFilter {
 
     pub fn switch_model(&self, model: Model) {
         let _ = self.cmd_tx.send(Cmd::SwitchModel(model));
+    }
+
+    pub fn enumerate_devices(&self) -> DeviceLists {
+        let (tx, rx) = bounded(1);
+        let _ = self.cmd_tx.send(Cmd::EnumerateDevices(tx));
+        rx.recv().unwrap_or_else(|_| DeviceLists {
+            sinks: Vec::new(),
+            sources: Vec::new(),
+            default_sink: String::new(),
+            default_source: String::new(),
+        })
+    }
+
+    pub fn set_sink(&self, name: String) {
+        let _ = self.cmd_tx.send(Cmd::SetSink(name));
+    }
+
+    pub fn set_source(&self, name: String) {
+        let _ = self.cmd_tx.send(Cmd::SetSource(name));
     }
 
     pub fn status_receiver(&self) -> &Receiver<Status> {

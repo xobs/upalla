@@ -25,6 +25,8 @@ struct UpallaApp {
     status_rx: Receiver<upalla_pa::Status>,
     tray_done: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
+    prev_sink: String,
+    prev_source: String,
 }
 
 impl UpallaApp {
@@ -41,6 +43,8 @@ impl UpallaApp {
             status_rx,
             tray_done,
             enabled,
+            prev_sink: String::new(),
+            prev_source: String::new(),
         }
     }
 }
@@ -65,6 +69,13 @@ impl eframe::App for UpallaApp {
         while let Ok(status) = self.status_rx.try_recv() {
             self.gui_state.rms_in = status.rms_in;
             self.gui_state.rms_out = status.rms_out;
+        }
+
+        // Device refresh
+        if self.gui_state.refresh_devices {
+            self.gui_state.refresh_devices = false;
+            self.gui_state
+                .set_devices(self.pa.enumerate_devices());
         }
 
         // Process tray actions BEFORE rendering so the GUI reflects them
@@ -94,6 +105,17 @@ impl eframe::App for UpallaApp {
 
         // Render GUI (now with up-to-date enabled/bypass state)
         app::render_gui(ctx, &mut self.gui_state);
+
+        // Handle device changes
+        if self.gui_state.selected_sink != self.prev_sink {
+            self.prev_sink = self.gui_state.selected_sink.clone();
+            self.pa.set_sink(self.gui_state.selected_sink.clone());
+        }
+        if self.gui_state.selected_source != self.prev_source {
+            self.prev_source = self.gui_state.selected_source.clone();
+            self.pa
+                .set_source(self.gui_state.selected_source.clone());
+        }
 
         // Sync GUI checkbox back to enabled, then to PA
         let gui_enabled = !self.gui_state.bypass;
@@ -131,7 +153,7 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 320.0])
+            .with_inner_size([420.0, 360.0])
             .with_title("Upalla"),
         ..Default::default()
     };

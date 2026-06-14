@@ -26,8 +26,25 @@ pub struct Status {
     pub rms_out: f32,
 }
 
+#[derive(Clone)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Clone)]
+pub struct DeviceLists {
+    pub sinks: Vec<DeviceInfo>,
+    pub sources: Vec<DeviceInfo>,
+    pub default_sink: String,
+    pub default_source: String,
+}
+
 pub enum Cmd {
     SwitchModel(Model),
+    EnumerateDevices(Sender<DeviceLists>),
+    SetSink(String),
+    SetSource(String),
     Shutdown,
 }
 
@@ -165,6 +182,105 @@ fn compute_rms(chunk: &[f32]) -> f32 {
     (sum / chunk.len() as f32).sqrt()
 }
 
+fn enumerate_devices(mainloop: &mut Mainloop, context: &Context) -> DeviceLists {
+    use libpulse_binding::callbacks::ListResult;
+
+    // Get default device names via server info
+    let dsn = Rc::new(RefCell::new(String::new()));
+    let dso = Rc::new(RefCell::new(String::new()));
+    let done = Rc::new(RefCell::new(false));
+    {
+        let sn = dsn.clone();
+        let so = dso.clone();
+        let d = done.clone();
+        let intro = context.introspect();
+        intro.get_server_info(move |info| {
+            *sn.borrow_mut() = info
+                .default_sink_name
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            *so.borrow_mut() = info
+                .default_source_name
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            *d.borrow_mut() = true;
+        });
+    }
+    while !*done.borrow() {
+        mainloop.iterate(true);
+    }
+    let default_sink = dsn.take();
+    let default_source = dso.take();
+
+    // Query sinks
+    let sinks = collect_list(mainloop, context, |intro, l, d| {
+        intro.get_sink_info_list(move |result| match result {
+            ListResult::Item(info) => {
+                if let (Some(name), Some(desc)) =
+                    (info.name.as_ref(), info.description.as_ref())
+                {
+                    l.borrow_mut().push(DeviceInfo {
+                        name: name.to_string(),
+                        description: desc.to_string(),
+                    });
+                }
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        });
+    });
+
+    // Query sources
+    let sources = collect_list(mainloop, context, |intro, l, d| {
+        intro.get_source_info_list(move |result| match result {
+            ListResult::Item(info) => {
+                if let (Some(name), Some(desc)) =
+                    (info.name.as_ref(), info.description.as_ref())
+                {
+                    l.borrow_mut().push(DeviceInfo {
+                        name: name.to_string(),
+                        description: desc.to_string(),
+                    });
+                }
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        });
+    });
+
+    log::info!(
+        "Enumerated {} sinks, {} sources (default sink: {}, default source: {})",
+        sinks.len(),
+        sources.len(),
+        default_sink,
+        default_source,
+    );
+    DeviceLists {
+        sinks,
+        sources,
+        default_sink,
+        default_source,
+    }
+}
+
+fn collect_list<F>(mainloop: &mut Mainloop, context: &Context, register: F) -> Vec<DeviceInfo>
+where
+    F: FnOnce(
+        pulse::context::introspect::Introspector,
+        Rc<RefCell<Vec<DeviceInfo>>>,
+        Rc<RefCell<bool>>,
+    ),
+{
+    let list = Rc::new(RefCell::new(Vec::new()));
+    let done = Rc::new(RefCell::new(false));
+    let intro = context.introspect();
+    register(intro, list.clone(), done.clone());
+    while !*done.borrow() {
+        mainloop.iterate(true);
+    }
+    list.take()
+}
+
 pub fn run_filter(
     model: Model,
     cmd_rx: Receiver<Cmd>,
@@ -273,8 +389,9 @@ pub fn run_filter(
 
     let mut sink_play =
         Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
+    let mut sink_play_dest = "@DEFAULT_SINK@".to_string();
     sink_play.connect_playback(
-        Some("@DEFAULT_SINK@"),
+        Some(&sink_play_dest),
         playback_attr.as_ref(),
         play_flags,
         None,
@@ -282,7 +399,8 @@ pub fn run_filter(
     )?;
 
     let mut src_rec = Stream::new(&mut context, "src-rec", &spec, None).context("src rec")?;
-    src_rec.connect_record(Some("@DEFAULT_SOURCE@"), record_attr.as_ref(), recv_flags)?;
+    let mut src_rec_source = "@DEFAULT_SOURCE@".to_string();
+    src_rec.connect_record(Some(&src_rec_source), record_attr.as_ref(), recv_flags)?;
 
     let mut src_play =
         Stream::new(&mut context, "src-play", &spec, None).context("src play")?;
@@ -309,12 +427,50 @@ pub fn run_filter(
     let mut rms_count = 0u32;
 
     loop {
-        if let Ok(cmd) = cmd_rx.try_recv() {
+        while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::SwitchModel(new_model) => {
                     log::info!("Switching model to {}", new_model.label());
                     denoiser_sink = Denoiser::new(&new_model, 2)?;
                     denoiser_src = Denoiser::new(&new_model, 2)?;
+                }
+                Cmd::EnumerateDevices(tx) => {
+                    let devices = enumerate_devices(&mut mainloop, &context);
+                    let _ = tx.send(devices);
+                }
+                Cmd::SetSink(name) => {
+                    log::info!("Switching sink output to {name}");
+                    sink_play_dest = name;
+                    drop(std::mem::replace(
+                        &mut sink_play,
+                        Stream::new(&mut context, "sink-play", &spec, None)
+                            .context("sink play")?,
+                    ));
+                    sink_play.connect_playback(
+                        Some(&sink_play_dest),
+                        playback_attr.as_ref(),
+                        play_flags,
+                        None,
+                        None,
+                    )?;
+                    sink_out.data.clear();
+                    sink_out.pos = 0;
+                }
+                Cmd::SetSource(name) => {
+                    log::info!("Switching source input to {name}");
+                    src_rec_source = name;
+                    drop(std::mem::replace(
+                        &mut src_rec,
+                        Stream::new(&mut context, "src-rec", &spec, None)
+                            .context("src rec")?,
+                    ));
+                    src_rec.connect_record(
+                        Some(&src_rec_source),
+                        record_attr.as_ref(),
+                        recv_flags,
+                    )?;
+                    src_in.data.clear();
+                    src_in.pos = 0;
                 }
                 Cmd::Shutdown => {
                     log::info!("PA filter received shutdown command");
