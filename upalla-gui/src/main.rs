@@ -7,7 +7,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use eframe::egui;
-use tray_icon::menu::MenuEvent;
 use upalla_core::model::Model;
 use upalla_pa::PaFilter;
 
@@ -15,11 +14,9 @@ mod app;
 mod icon;
 mod tray;
 
-#[derive(Clone, Copy, Debug)]
-pub enum TrayAction {
-    Show,
-    Hide,
-    ToggleEnabled,
+enum Control {
+    #[cfg(target_os = "linux")]
+    Open,
     Quit,
 }
 
@@ -34,13 +31,10 @@ struct UpallaApp {
     last_device_refresh: Instant,
     #[cfg(target_os = "macos")]
     enabled_check: Arc<tray_icon::menu::CheckMenuItem>,
-}
-
-enum Control {
-    /// Open a new window
-    Open,
-    /// Quit the program
-    Quit,
+    #[cfg(target_os = "macos")]
+    show_requested: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    window_visible: Arc<AtomicBool>,
 }
 
 impl UpallaApp {
@@ -49,8 +43,20 @@ impl UpallaApp {
         status_rx: Receiver<upalla_pa::Status>,
         control: Receiver<Control>,
         #[cfg(target_os = "macos")] enabled_check: Arc<tray_icon::menu::CheckMenuItem>,
+        #[cfg(target_os = "macos")] show_requested: Arc<AtomicBool>,
+        #[cfg(target_os = "macos")] window_visible: Arc<AtomicBool>,
     ) -> Self {
         let previous_bypass = pa.bypass();
+        #[cfg(target_os = "macos")]
+        {
+            // Hide immediately — eframe may show the window despite
+            // with_visible(false). Also ensure Accessory policy persists.
+            use objc2::MainThreadMarker;
+            use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+            let mtm = MainThreadMarker::new().unwrap();
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        }
         UpallaApp {
             pa,
             gui_state: app::AppGuiState::new(),
@@ -62,6 +68,10 @@ impl UpallaApp {
             last_device_refresh: Instant::now(),
             #[cfg(target_os = "macos")]
             enabled_check,
+            #[cfg(target_os = "macos")]
+            show_requested,
+            #[cfg(target_os = "macos")]
+            window_visible,
         }
     }
 }
@@ -76,9 +86,30 @@ impl eframe::App for UpallaApp {
         }
 
         if let Ok(Control::Quit) = self.control.try_recv() {
-            log::debug!("Quit message received in logic -- closing viewport");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // Hide window on first frame — with_visible(false) is not
+            // always respected by the platform.
+            if !self.window_visible.load(Ordering::Relaxed) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+
+            if self.show_requested.swap(false, Ordering::SeqCst) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.window_visible.store(true, Ordering::Relaxed);
+            }
+
+            // Intercept native close — hide instead of quitting.
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.window_visible.store(false, Ordering::Relaxed);
+            }
         }
 
         if self.last_device_refresh.elapsed() >= std::time::Duration::from_secs(1) {
@@ -100,35 +131,23 @@ impl eframe::App for UpallaApp {
             self.pa.set_source(self.gui_state.selected_source.clone());
         }
 
-        // Two-way sync: GUI checkbox <-> PA bypass <-> tray checkmark
         if self.gui_state.bypass != self.previous_bypass {
-            log::trace!(
-                "GUI bypass changed -- new state is {}",
-                self.gui_state.bypass
-            );
             self.pa.set_bypass(self.gui_state.bypass);
         } else if self.gui_state.bypass != self.pa.bypass() {
             self.gui_state.bypass = self.pa.bypass();
-            log::trace!(
-                "PA bypass changed -- new state is {}",
-                self.gui_state.bypass
-            );
         }
         self.previous_bypass = self.gui_state.bypass;
 
-        // On macOS the tray checkmark must be updated from the main thread.
         #[cfg(target_os = "macos")]
         {
-            let enabled = !self.gui_state.bypass;
-            self.enabled_check.set_checked(enabled);
+            self.enabled_check.set_checked(!self.gui_state.bypass);
         }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx();
-        app::render_gui(ctx, &mut self.gui_state);
+        app::render_gui(ui.ctx(), &mut self.gui_state);
     }
 }
 
@@ -140,13 +159,27 @@ fn main() -> Result<()> {
     let pa = Arc::new(PaFilter::new(Model::default(), Arc::clone(&enabled))?);
     let status_rx = pa.status_receiver().clone();
 
-    // ---------- Tray setup ----------
-    // On Linux: spawn a GTK thread that runs the tray event loop.
-    // On macOS: create the tray on the main thread (NSMenu requirement).
+    let (control_tx, control_rx) = crossbeam_channel::unbounded();
+
+    ctrlc::set_handler({
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let control_tx = control_tx.clone();
+        move || {
+            if !shutting_down.swap(true, Ordering::SeqCst) {
+                println!("Ctrl-C pressed, shutting down");
+                let _ = control_tx.try_send(Control::Quit);
+            }
+        }
+    })
+    .context("ctrlc")?;
+
+    // ---------- Platform-specific tray setup and event loop ----------
+
     #[cfg(target_os = "linux")]
-    let (tray_ids, _tray_done) = {
+    {
         let tray_done = Arc::new(AtomicBool::new(false));
         let (ids_tx, ids_rx) = crossbeam_channel::bounded(1);
+        let (window_tx, window_rx) = crossbeam_channel::bounded(1);
 
         let _handle = thread::Builder::new()
             .name("upalla-tray".into())
@@ -161,164 +194,113 @@ fn main() -> Result<()> {
             .recv_timeout(std::time::Duration::from_secs(3))
             .context("Unable to get tray IDs")?;
 
-        (tray_ids, tray_done)
-    };
-
-    #[cfg(target_os = "macos")]
-    let (tray_ids, enabled_check) = tray::create_tray(&enabled);
-
-    // ---------- eframe options ----------
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 420.0])
-            .with_title("Upalla")
-            .with_icon(std::sync::Arc::new(icon::window_icon())),
-        ..Default::default()
-    };
-
-    // ---------- Window / control channels ----------
-    let window_open = Arc::new(AtomicBool::new(false));
-    let (window_tx, window_rx) = crossbeam_channel::bounded(1);
-    let (control_tx, control_rx) = crossbeam_channel::bounded(1);
-
-    ctrlc::set_handler({
-        let shutting_down = Arc::new(AtomicBool::new(false));
-        let control_tx = control_tx.clone();
-        let window_tx = window_tx.clone();
-        move || {
-            if !shutting_down.swap(true, Ordering::SeqCst) {
-                println!("Ctrl-C pressed, shutting down");
-                let _ = control_tx.try_send(Control::Quit);
-                let _ = window_tx.try_send(Control::Quit);
-            }
-        }
-    })
-    .context("ctrlc")?;
-
-    let tray_event_handler = {
-        let pa = Arc::clone(&pa);
-        let window_open = Arc::clone(&window_open);
-        move |event: MenuEvent| {
-            if event.id == tray_ids.show_hide && window_tx.is_empty() {
-                if !window_open.load(Ordering::Relaxed) {
-                    let _ = window_tx.send(Control::Open);
+        std::thread::spawn({
+            let pa = Arc::clone(&pa);
+            let window_open = Arc::new(AtomicBool::new(false));
+            move || {
+                while let Ok(event) = tray_icon::menu::MenuEvent::receiver().recv() {
+                    if event.id == tray_ids.show_hide && window_tx.is_empty() {
+                        if !window_open.load(Ordering::Relaxed) {
+                            let _ = window_tx.send(Control::Open);
+                        }
+                    } else if event.id == tray_ids.enabled {
+                        pa.set_bypass(!pa.bypass());
+                    } else if event.id == tray_ids.quit {
+                        let _ = control_tx.send(Control::Quit);
+                        break;
+                    }
                 }
-            } else if event.id == tray_ids.enabled {
-                pa.set_bypass(!pa.bypass());
-            } else if event.id == tray_ids.quit {
-                let _ = control_tx.send(Control::Quit);
-                log::info!("Got quit message");
-            } else {
-                log::debug!("Unrecognized event: {event:?}");
             }
-        }
-    };
+        });
 
-    tray_icon::menu::MenuEvent::set_event_handler(Some(tray_event_handler));
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([420.0, 420.0])
+                .with_title("Upalla")
+                .with_icon(Arc::new(icon::window_icon())),
+            ..Default::default()
+        };
 
-    // ---------- Window event loop ----------
-    // On macOS the main thread must pump the run loop for NSStatusItem to appear.
-    #[cfg(target_os = "linux")]
-    {
         while let Ok(Control::Open) = window_rx.recv() {
-            run_eframe(&pa, &status_rx, &control_rx, &window_open, &options)?;
+            eframe::run_native(
+                "Upalla",
+                options.clone(),
+                Box::new({
+                    let pa = pa.clone();
+                    let status_rx = status_rx.clone();
+                    let control_rx = control_rx.clone();
+                    move |_cc| Ok(Box::new(UpallaApp::new(pa, status_rx, control_rx)))
+                }),
+            )?;
         }
     }
 
     #[cfg(target_os = "macos")]
     {
-        use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoopRunInMode};
-        loop {
-            // Pump the main run loop so NSStatusItem + NSMenu can receive clicks.
-            log::info!("Calling CFRunLoopRunInMode()...");
-            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1u8) };
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-            log::info!("Trying to receive window_rx...");
-            match window_rx.try_recv() {
-                Ok(Control::Open) => {
-                    log::info!("Running eframe...");
-                    run_eframe(
-                        &pa,
-                        &status_rx,
-                        &control_rx,
-                        &window_open,
-                        &options,
-                        &enabled_check,
-                    )?;
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    log::info!("Got an empty message");
-                }
-                Ok(Control::Quit) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    log::info!("Disconnected message");
-                    break;
+        let mtm = MainThreadMarker::new().expect("must be on main thread");
+        let app = NSApplication::sharedApplication(mtm);
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
+        let (tray_ids, enabled_check) = tray::create_tray(&enabled);
+
+        let show_requested = Arc::new(AtomicBool::new(false));
+        let window_visible = Arc::new(AtomicBool::new(false));
+
+        // Menu events → background thread.
+        std::thread::spawn({
+            let pa = Arc::clone(&pa);
+            let show_requested = Arc::clone(&show_requested);
+            let window_visible = Arc::clone(&window_visible);
+            let control_tx = control_tx.clone();
+            move || {
+                while let Ok(event) = tray_icon::menu::MenuEvent::receiver().recv() {
+                    if event.id == tray_ids.show_hide {
+                        if !window_visible.load(Ordering::Relaxed) {
+                            show_requested.store(true, Ordering::SeqCst);
+                        }
+                    } else if event.id == tray_ids.enabled {
+                        pa.set_bypass(!pa.bypass());
+                    } else if event.id == tray_ids.quit {
+                        let _ = control_tx.try_send(Control::Quit);
+                        break;
+                    }
                 }
             }
+        });
 
-            log::info!("Trying to receive control_rx...");
-            if let Ok(Control::Quit) = control_rx.try_recv() {
-                break;
-            }
-        }
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([420.0, 420.0])
+                .with_title("Upalla")
+                .with_icon(Arc::new(icon::window_icon()))
+                .with_visible(false),
+            ..Default::default()
+        };
+
+        // Always run eframe — this keeps [NSApp run] active for CoreAudio.
+        eframe::run_native(
+            "Upalla",
+            options,
+            Box::new({
+                let pa = pa.clone();
+                move |_cc| {
+                    Ok(Box::new(UpallaApp::new(
+                        pa.clone(),
+                        status_rx.clone(),
+                        control_rx.clone(),
+                        enabled_check.clone(),
+                        show_requested.clone(),
+                        window_visible.clone(),
+                    )))
+                }
+            }),
+        )?;
     }
 
-    log::debug!("eframe exited -- quitting");
+    log::debug!("quitting");
     pa.shutdown();
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn run_eframe(
-    pa: &Arc<PaFilter>,
-    status_rx: &Receiver<upalla_pa::Status>,
-    control_rx: &Receiver<Control>,
-    window_open: &Arc<AtomicBool>,
-    options: &eframe::NativeOptions,
-    enabled_check: &Arc<tray_icon::menu::CheckMenuItem>,
-) -> Result<()> {
-    window_open.store(true, Ordering::Relaxed);
-    eframe::run_native(
-        "Upalla",
-        options.clone(),
-        Box::new({
-            let pa = pa.clone();
-            let status_rx = status_rx.clone();
-            let control_rx = control_rx.clone();
-            let enabled_check = enabled_check.clone();
-            move |_cc| {
-                Ok(Box::new(UpallaApp::new(
-                    pa,
-                    status_rx,
-                    control_rx,
-                    enabled_check,
-                )))
-            }
-        }),
-    )?;
-    window_open.store(false, Ordering::Relaxed);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn run_eframe(
-    pa: &Arc<PaFilter>,
-    status_rx: &Receiver<upalla_pa::Status>,
-    control_rx: &Receiver<Control>,
-    window_open: &Arc<AtomicBool>,
-    options: &eframe::NativeOptions,
-) -> Result<()> {
-    window_open.store(true, Ordering::Relaxed);
-    eframe::run_native(
-        "Upalla",
-        options.clone(),
-        Box::new({
-            let pa = pa.clone();
-            let status_rx = status_rx.clone();
-            let control_rx = control_rx.clone();
-            move |_cc| Ok(Box::new(UpallaApp::new(pa, status_rx, control_rx)))
-        }),
-    )?;
-    window_open.store(false, Ordering::Relaxed);
     Ok(())
 }
