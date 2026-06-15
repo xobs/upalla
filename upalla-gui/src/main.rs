@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use eframe::egui;
+use tray_icon::menu::MenuEvent;
 use upalla_core::model::Model;
 use upalla_pa::PaFilter;
 
@@ -194,57 +195,130 @@ fn main() -> Result<()> {
     })
     .context("ctrlc")?;
 
-    // ---------- Tray menu event polling ----------
-    std::thread::spawn({
+    let tray_event_handler = {
         let pa = Arc::clone(&pa);
         let window_open = Arc::clone(&window_open);
-        move || {
-            while let Ok(event) = tray_icon::menu::MenuEvent::receiver().recv() {
-                if event.id == tray_ids.show_hide && window_tx.is_empty() {
-                    if !window_open.load(Ordering::Relaxed) {
-                        let _ = window_tx.send(Control::Open);
-                    }
-                } else if event.id == tray_ids.enabled {
-                    pa.set_bypass(!pa.bypass());
-                } else if event.id == tray_ids.quit {
-                    let _ = control_tx.send(Control::Quit);
-                    break;
-                } else {
-                    log::debug!("Unrecognized event: {event:?}");
+        move |event: MenuEvent| {
+            if event.id == tray_ids.show_hide && window_tx.is_empty() {
+                if !window_open.load(Ordering::Relaxed) {
+                    let _ = window_tx.send(Control::Open);
                 }
+            } else if event.id == tray_ids.enabled {
+                pa.set_bypass(!pa.bypass());
+            } else if event.id == tray_ids.quit {
+                let _ = control_tx.send(Control::Quit);
+                log::info!("Got quit message");
+            } else {
+                log::debug!("Unrecognized event: {event:?}");
             }
-            log::debug!("Tray thread exited");
         }
-    });
+    };
+
+    tray_icon::menu::MenuEvent::set_event_handler(Some(tray_event_handler));
 
     // ---------- Window event loop ----------
-    while let Ok(Control::Open) = window_rx.recv() {
-        window_open.store(true, Ordering::Relaxed);
-        eframe::run_native(
-            "Upalla",
-            options.clone(),
-            Box::new({
-                let pa = pa.clone();
-                let status_rx = status_rx.clone();
-                let control_rx = control_rx.clone();
-                #[cfg(target_os = "macos")]
-                let enabled_check = enabled_check.clone();
-                move |_cc| {
-                    Ok(Box::new(UpallaApp::new(
-                        pa,
-                        status_rx,
-                        control_rx,
-                        #[cfg(target_os = "macos")]
-                        enabled_check,
-                    )))
+    // On macOS the main thread must pump the run loop for NSStatusItem to appear.
+    #[cfg(target_os = "linux")]
+    {
+        while let Ok(Control::Open) = window_rx.recv() {
+            run_eframe(&pa, &status_rx, &control_rx, &window_open, &options)?;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoopRunInMode};
+        loop {
+            // Pump the main run loop so NSStatusItem + NSMenu can receive clicks.
+            log::info!("Calling CFRunLoopRunInMode()...");
+            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1u8) };
+
+            log::info!("Trying to receive window_rx...");
+            match window_rx.try_recv() {
+                Ok(Control::Open) => {
+                    log::info!("Running eframe...");
+                    run_eframe(
+                        &pa,
+                        &status_rx,
+                        &control_rx,
+                        &window_open,
+                        &options,
+                        &enabled_check,
+                    )?;
                 }
-            }),
-        )?;
-        window_open.store(false, Ordering::Relaxed);
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    log::info!("Got an empty message");
+                }
+                Ok(Control::Quit) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    log::info!("Disconnected message");
+                    break;
+                }
+            }
+
+            log::info!("Trying to receive control_rx...");
+            if let Ok(Control::Quit) = control_rx.try_recv() {
+                break;
+            }
+        }
     }
 
     log::debug!("eframe exited -- quitting");
     pa.shutdown();
 
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_eframe(
+    pa: &Arc<PaFilter>,
+    status_rx: &Receiver<upalla_pa::Status>,
+    control_rx: &Receiver<Control>,
+    window_open: &Arc<AtomicBool>,
+    options: &eframe::NativeOptions,
+    enabled_check: &Arc<tray_icon::menu::CheckMenuItem>,
+) -> Result<()> {
+    window_open.store(true, Ordering::Relaxed);
+    eframe::run_native(
+        "Upalla",
+        options.clone(),
+        Box::new({
+            let pa = pa.clone();
+            let status_rx = status_rx.clone();
+            let control_rx = control_rx.clone();
+            let enabled_check = enabled_check.clone();
+            move |_cc| {
+                Ok(Box::new(UpallaApp::new(
+                    pa,
+                    status_rx,
+                    control_rx,
+                    enabled_check,
+                )))
+            }
+        }),
+    )?;
+    window_open.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_eframe(
+    pa: &Arc<PaFilter>,
+    status_rx: &Receiver<upalla_pa::Status>,
+    control_rx: &Receiver<Control>,
+    window_open: &Arc<AtomicBool>,
+    options: &eframe::NativeOptions,
+) -> Result<()> {
+    window_open.store(true, Ordering::Relaxed);
+    eframe::run_native(
+        "Upalla",
+        options.clone(),
+        Box::new({
+            let pa = pa.clone();
+            let status_rx = status_rx.clone();
+            let control_rx = control_rx.clone();
+            move |_cc| Ok(Box::new(UpallaApp::new(pa, status_rx, control_rx)))
+        }),
+    )?;
+    window_open.store(false, Ordering::Relaxed);
     Ok(())
 }

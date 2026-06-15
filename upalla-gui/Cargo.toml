@@ -24,3 +24,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 eframe = { version = "0.34", default-features = false, features = ["wayland"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
