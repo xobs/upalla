@@ -662,15 +662,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-queue"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4254,23 +4245,6 @@ dependencies = [
  "env_logger",
  "libpulse-binding",
  "log",
- "upalla-core",
-]
-
-[[package]]
-name = "upalla-pw"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "crossbeam-queue",
- "ctrlc",
- "deep_filter",
- "env_logger",
- "hound",
- "libloading 0.8.9",
- "log",
- "ndarray",
  "upalla-core",
 ]
 
