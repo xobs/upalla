@@ -4370,6 +4370,7 @@ dependencies = [
  "egui",
  "env_logger",
  "gtk",
+ "image",
  "log",
  "tray-icon",
  "upalla-core",

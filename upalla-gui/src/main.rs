@@ -11,6 +11,7 @@ use upalla_core::model::Model;
 use upalla_pa::PaFilter;
 
 mod app;
+mod icon;
 mod tray;
 
 #[derive(Clone, Copy, Debug)]
@@ -168,8 +169,9 @@ fn main() -> Result<()> {
     // ---------- eframe options ----------
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 360.0])
-            .with_title("Upalla"),
+            .with_inner_size([420.0, 420.0])
+            .with_title("Upalla")
+            .with_icon(std::sync::Arc::new(icon::window_icon())),
         ..Default::default()
     };
 

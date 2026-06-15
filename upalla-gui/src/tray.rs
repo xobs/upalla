@@ -39,7 +39,8 @@ mod linux_impl {
         menu.append(&enabled_item).expect("append");
         menu.append(&quit).expect("append");
 
-        let icon = tray_icon::Icon::from_rgba(vec![0u8; 64 * 64 * 4], 64, 64).expect("create icon");
+        let icon = tray_icon::Icon::from_rgba(crate::icon::tray_rgba(), 64, 64)
+            .expect("create icon");
 
         let _tray = TrayIconBuilder::new()
             .with_tooltip("Upalla")
@@ -100,7 +101,8 @@ pub fn create_tray(
     menu.append(&enabled_item).expect("append");
     menu.append(&quit).expect("append");
 
-    let icon = tray_icon::Icon::from_rgba(vec![0u8; 64 * 64 * 4], 64, 64).expect("create icon");
+    let icon = tray_icon::Icon::from_rgba(crate::icon::tray_rgba(), 64, 64)
+        .expect("create icon");
 
     let _tray = TrayIconBuilder::new()
         .with_tooltip("Upalla")
