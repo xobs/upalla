@@ -39,8 +39,8 @@ mod linux_impl {
         menu.append(&enabled_item).expect("append");
         menu.append(&quit).expect("append");
 
-        let icon = tray_icon::Icon::from_rgba(crate::icon::tray_rgba(), 64, 64)
-            .expect("create icon");
+        let icon =
+            tray_icon::Icon::from_rgba(crate::icon::tray_rgba(), 64, 64).expect("create icon");
 
         let _tray = TrayIconBuilder::new()
             .with_tooltip("Upalla")
@@ -73,12 +73,9 @@ mod linux_impl {
 pub use linux_impl::run_tray;
 
 #[cfg(target_os = "macos")]
-pub fn create_tray(
+pub fn run_tray(
     enabled: &std::sync::atomic::AtomicBool,
-) -> (
-    TrayMenuIds,
-    std::sync::Arc<tray_icon::menu::CheckMenuItem>,
-) {
+) -> (TrayMenuIds, std::sync::Arc<tray_icon::menu::CheckMenuItem>) {
     use std::sync::atomic::Ordering;
 
     use tray_icon::menu::{CheckMenuItem, Menu, MenuItem};
@@ -87,8 +84,7 @@ pub fn create_tray(
     let menu = Menu::new();
 
     let show_hide = MenuItem::new("Show", true, None);
-    let enabled_item =
-        CheckMenuItem::new("Enabled", true, enabled.load(Ordering::Relaxed), None);
+    let enabled_item = CheckMenuItem::new("Enabled", true, enabled.load(Ordering::Relaxed), None);
     let quit = MenuItem::new("Quit", true, None);
 
     let ids = TrayMenuIds {
@@ -101,8 +97,7 @@ pub fn create_tray(
     menu.append(&enabled_item).expect("append");
     menu.append(&quit).expect("append");
 
-    let icon = tray_icon::Icon::from_rgba(crate::icon::tray_rgba(), 64, 64)
-        .expect("create icon");
+    let icon = tray_icon::Icon::from_rgba(crate::icon::tray_rgba(), 64, 64).expect("create icon");
 
     let _tray = TrayIconBuilder::new()
         .with_tooltip("Upalla")
