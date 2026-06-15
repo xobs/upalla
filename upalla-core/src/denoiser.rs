@@ -29,21 +29,42 @@ impl Denoiser {
 
     pub fn process_stereo(&mut self, input: &StereoChunk) -> Result<StereoChunk> {
         let mut frame = Array2::<f32>::zeros((2, CHUNK));
-        frame.row_mut(0).as_slice_mut().unwrap().copy_from_slice(&input.left);
-        frame.row_mut(1).as_slice_mut().unwrap().copy_from_slice(&input.right);
+        frame
+            .row_mut(0)
+            .as_slice_mut()
+            .unwrap()
+            .copy_from_slice(&input.left);
+        frame
+            .row_mut(1)
+            .as_slice_mut()
+            .unwrap()
+            .copy_from_slice(&input.right);
         let noisy_view = frame.view();
         let mut enhanced = Array2::<f32>::zeros((2, CHUNK));
         let enh_view = enhanced.view_mut();
         self.model.process(noisy_view, enh_view)?;
-        let mut out = StereoChunk { left: [0.0; CHUNK], right: [0.0; CHUNK] };
-        out.left.copy_from_slice(enhanced.row(0).as_slice().unwrap());
-        out.right.copy_from_slice(enhanced.row(1).as_slice().unwrap());
+        let mut out = StereoChunk {
+            left: [0.0; CHUNK],
+            right: [0.0; CHUNK],
+        };
+        out.left
+            .copy_from_slice(enhanced.row(0).as_slice().unwrap());
+        out.right
+            .copy_from_slice(enhanced.row(1).as_slice().unwrap());
         Ok(out)
     }
 
-    pub fn process_mono(&mut self, input: &[f32; CHUNK], output: &mut [f32; CHUNK]) -> Result<usize> {
+    pub fn process_mono(
+        &mut self,
+        input: &[f32; CHUNK],
+        output: &mut [f32; CHUNK],
+    ) -> Result<usize> {
         let mut frame = Array2::<f32>::zeros((1, CHUNK));
-        frame.row_mut(0).as_slice_mut().unwrap().copy_from_slice(input);
+        frame
+            .row_mut(0)
+            .as_slice_mut()
+            .unwrap()
+            .copy_from_slice(input);
         let noisy_view = frame.view();
         let mut enhanced = Array2::<f32>::zeros((1, CHUNK));
         let enh_view = enhanced.view_mut();

@@ -18,7 +18,11 @@ pub fn read_wav_stereo(path: &Path) -> anyhow::Result<(Vec<f32>, Vec<f32>, u32)>
         let mut r = Vec::with_capacity(n / ch);
         for i in 0..n / ch {
             l.push(samples[i * ch] as f32 / 32767.0);
-            r.push(if ch >= 2 { samples[i * ch + 1] as f32 / 32767.0 } else { l[i] });
+            r.push(if ch >= 2 {
+                samples[i * ch + 1] as f32 / 32767.0
+            } else {
+                l[i]
+            });
         }
         (l, r)
     } else if spec.sample_format == hound::SampleFormat::Float {

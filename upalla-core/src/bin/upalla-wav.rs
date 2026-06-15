@@ -52,7 +52,10 @@ fn main() -> Result<()> {
         let start = i * CHUNK;
         let end = start + CHUNK;
 
-        let mut sc = StereoChunk { left: [0.0; CHUNK], right: [0.0; CHUNK] };
+        let mut sc = StereoChunk {
+            left: [0.0; CHUNK],
+            right: [0.0; CHUNK],
+        };
         sc.left.copy_from_slice(&left[start..end]);
         sc.right.copy_from_slice(&right[start..end]);
 
@@ -63,12 +66,19 @@ fn main() -> Result<()> {
 
     let elapsed = t0.elapsed().as_secs_f32();
     let audio_len = n_pad as f32 / sr as f32;
-    log::info!("Processed {:.1}s in {:.1}s (RTF: {:.2})", audio_len, elapsed, elapsed/audio_len);
+    log::info!(
+        "Processed {:.1}s in {:.1}s (RTF: {:.2})",
+        audio_len,
+        elapsed,
+        elapsed / audio_len
+    );
 
     log::info!("Writing {}", args.output_file.display());
     upalla_core::wav::write_wav_stereo(
         args.output_file.to_str().unwrap(),
-        &enhanced_left, &enhanced_right, sr,
+        &enhanced_left,
+        &enhanced_right,
+        sr,
     )?;
     Ok(())
 }

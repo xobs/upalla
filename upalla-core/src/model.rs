@@ -2,15 +2,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-#[derive(Clone)]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub enum Model {
     #[default]
     DeepFilterNet3,
     DeepFilterNet3Ll,
     Custom(PathBuf),
 }
-
 
 impl Model {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
