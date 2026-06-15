@@ -42,17 +42,11 @@ pub struct spa_fraction {
 pub struct PwFilterEvents {
     pub version: u32,
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
-    pub state_changed: Option<
-        unsafe extern "C" fn(*mut c_void, i32, i32, *const c_char),
-    >,
-    pub io_changed:
-        Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32)>,
-    pub param_changed:
-        Option<unsafe extern "C" fn(*mut c_void, u32, *const c_void)>,
-    pub add_buffer:
-        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-    pub remove_buffer:
-        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
+    pub state_changed: Option<unsafe extern "C" fn(*mut c_void, i32, i32, *const c_char)>,
+    pub io_changed: Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32)>,
+    pub param_changed: Option<unsafe extern "C" fn(*mut c_void, u32, *const c_void)>,
+    pub add_buffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
+    pub remove_buffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
     pub process: Option<unsafe extern "C" fn(*mut c_void, *mut spa_io_position)>,
     pub drained: Option<unsafe extern "C" fn(*mut c_void)>,
     pub command: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
@@ -92,7 +86,6 @@ pub struct PwApi {
     pub pw_filter_get_dsp_buffer: usize,
     pub pw_filter_destroy: usize,
     pub pw_properties_new_string: usize,
-    pub pw_properties_free: usize,
 }
 
 // C helper compiled from pw_format.c
@@ -132,8 +125,7 @@ pub unsafe fn call_pw_main_loop_get_loop(api: &PwApi, l: *mut c_void) -> *mut c_
 }
 
 pub unsafe fn call_pw_main_loop_run(api: &PwApi, l: *mut c_void) -> c_int {
-    let f: unsafe extern "C" fn(*mut c_void) -> c_int =
-        std::mem::transmute(api.pw_main_loop_run);
+    let f: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(api.pw_main_loop_run);
     f(l)
 }
 
@@ -147,18 +139,10 @@ pub unsafe fn call_pw_main_loop_destroy(api: &PwApi, l: *mut c_void) {
     f(l);
 }
 
-pub unsafe fn call_pw_properties_new_string(
-    api: &PwApi,
-    str_: *const c_char,
-) -> *mut c_void {
+pub unsafe fn call_pw_properties_new_string(api: &PwApi, str_: *const c_char) -> *mut c_void {
     let f: unsafe extern "C" fn(*const c_char) -> *mut c_void =
         std::mem::transmute(api.pw_properties_new_string);
     f(str_)
-}
-
-pub unsafe fn call_pw_properties_free(api: &PwApi, props: *mut c_void) {
-    let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(api.pw_properties_free);
-    f(props);
 }
 
 pub unsafe fn call_pw_filter_new_simple(
@@ -198,7 +182,15 @@ pub unsafe fn call_pw_filter_add_port(
         *const c_void,
         u32,
     ) -> *mut c_void = std::mem::transmute(api.pw_filter_add_port);
-    f(filter, direction, flags, port_data_size, port_props, params, n_params)
+    f(
+        filter,
+        direction,
+        flags,
+        port_data_size,
+        port_props,
+        params,
+        n_params,
+    )
 }
 
 pub unsafe fn call_pw_filter_connect(
@@ -250,7 +242,6 @@ impl PwApi {
             pw_filter_get_dsp_buffer: fpret!(lib, "pw_filter_get_dsp_buffer", (*mut c_void, u32) -> *mut f32),
             pw_filter_destroy: fp!(lib, "pw_filter_destroy", *mut c_void),
             pw_properties_new_string: fpret!(lib, "pw_properties_new_string", (*const c_char) -> *mut c_void),
-            pw_properties_free: fp!(lib, "pw_properties_free", *mut c_void),
             lib,
         })
     }

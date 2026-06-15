@@ -145,7 +145,7 @@ impl Drop for RegisteredModules {
 }
 
 fn pump_read(stream: &mut Stream, buf: &mut AudioBuf) {
-    let readable = stream.readable_size().unwrap_or(0) as usize;
+    let readable = stream.readable_size().unwrap_or(0);
     if readable < 4 {
         return;
     }
@@ -166,7 +166,7 @@ fn pump_read(stream: &mut Stream, buf: &mut AudioBuf) {
 
 fn pump_write(stream: &mut Stream, buf: &mut AudioBuf) {
     let bps: usize = 4;
-    let writable = stream.writable_size().unwrap_or(0) as usize;
+    let writable = stream.writable_size().unwrap_or(0);
     let avail = buf.len().min(writable / bps);
     if avail == 0 {
         return;
