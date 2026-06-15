@@ -27,7 +27,13 @@ fn main() -> Result<()> {
 
     while !shutting_down.load(Ordering::Relaxed) {
         if let Ok(status) = status_rx.recv_timeout(std::time::Duration::from_millis(250)) {
-            log::debug!("rms_in={:.4} rms_out={:.4}", status.rms_in, status.rms_out);
+            log::debug!(
+                "playback_in={:.4} playback_out={:.4} recording_in={:.4} recording_out={:.4}",
+                status.playback_in,
+                status.playback_out,
+                status.recording_in,
+                status.recording_out
+            );
         }
     }
 

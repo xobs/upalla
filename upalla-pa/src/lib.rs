@@ -5,10 +5,21 @@ use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use upalla_core::model::Model;
 
+#[cfg(target_os = "linux")]
 mod filter;
 
+#[cfg(target_os = "macos")]
+mod filter_ca;
+
+#[cfg(target_os = "linux")]
 use filter::Cmd;
+#[cfg(target_os = "linux")]
 pub use filter::{DeviceInfo, DeviceLists, Status};
+
+#[cfg(target_os = "macos")]
+use filter_ca::Cmd;
+#[cfg(target_os = "macos")]
+pub use filter_ca::{DeviceInfo, DeviceLists, Status};
 
 pub struct PaFilter {
     cmd_tx: Sender<Cmd>,
@@ -23,12 +34,21 @@ impl PaFilter {
         let (status_tx, status_rx) = bounded::<Status>(8);
 
         let handle = std::thread::Builder::new()
-            .name("upalla-pa".into())
+            .name("upalla-audio".into())
             .spawn({
                 let enabled = Arc::clone(&enabled);
                 move || {
-                    if let Err(e) = filter::run_filter(model, cmd_rx, status_tx, enabled) {
-                        log::error!("PA filter thread error: {e}");
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Err(e) = filter::run_filter(model, cmd_rx, status_tx, enabled) {
+                            log::error!("PA filter thread error: {e}");
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Err(e) = filter_ca::run_filter(model, cmd_rx, status_tx, enabled) {
+                            log::error!("CA filter thread error: {e}");
+                        }
                     }
                 }
             })?;

@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::process::Command;
@@ -22,8 +24,10 @@ const SRC_VIRTUAL_NAME: &str = "upalla_virtual";
 const REMAINDER_CAP: usize = 16384;
 
 pub struct Status {
-    pub rms_in: f32,
-    pub rms_out: f32,
+    pub playback_in: f32,
+    pub playback_out: f32,
+    pub recording_in: f32,
+    pub recording_out: f32,
 }
 
 #[derive(Clone)]
@@ -420,8 +424,9 @@ pub fn run_filter(
     let frame_size = CHUNK * 2; // 20ms at 48kHz
 
     let mut last_status = Instant::now();
-    let mut rms_accum = [0.0f32; 4];
-    let mut rms_count = 0u32;
+    let mut rms_accum = [0.0f32; 8];
+    let mut rms_count_sink = 0u32;
+    let mut rms_count_src = 0u32;
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -497,17 +502,33 @@ pub fn run_filter(
                 rms_accum[1] += compute_rms(&sc.right);
                 rms_accum[2] += compute_rms(&sc.left);
                 rms_accum[3] += compute_rms(&sc.right);
-                rms_count += 1;
-            } else if let Ok(out) = denoiser_sink.process_stereo(&sc) {
-                for i in 0..CHUNK {
-                    sink_out.data.push(out.left[i]);
-                    sink_out.data.push(out.right[i]);
+                rms_count_sink += 1;
+            } else {
+                match denoiser_sink.process_stereo(&sc) {
+                    Ok(out) => {
+                        for i in 0..CHUNK {
+                            sink_out.data.push(out.left[i]);
+                            sink_out.data.push(out.right[i]);
+                        }
+                        rms_accum[0] += compute_rms(&sc.left);
+                        rms_accum[1] += compute_rms(&sc.right);
+                        rms_accum[2] += compute_rms(&out.left);
+                        rms_accum[3] += compute_rms(&out.right);
+                        rms_count_sink += 1;
+                    }
+                    Err(e) => {
+                        log::error!("Denoiser sink error: {e}, falling back to bypass");
+                        for i in 0..CHUNK {
+                            sink_out.data.push(sc.left[i]);
+                            sink_out.data.push(sc.right[i]);
+                        }
+                        rms_accum[0] += compute_rms(&sc.left);
+                        rms_accum[1] += compute_rms(&sc.right);
+                        rms_accum[2] += compute_rms(&sc.left);
+                        rms_accum[3] += compute_rms(&sc.right);
+                        rms_count_sink += 1;
+                    }
                 }
-                rms_accum[0] += compute_rms(&sc.left);
-                rms_accum[1] += compute_rms(&sc.right);
-                rms_accum[2] += compute_rms(&out.left);
-                rms_accum[3] += compute_rms(&out.right);
-                rms_count += 1;
             }
         }
         while let Some(frame) = src_in.drain_frames(frame_size) {
@@ -524,10 +545,36 @@ pub fn run_filter(
                     src_out.data.push(sc.left[i]);
                     src_out.data.push(sc.right[i]);
                 }
-            } else if let Ok(out) = denoiser_src.process_stereo(&sc) {
-                for i in 0..CHUNK {
-                    src_out.data.push(out.left[i]);
-                    src_out.data.push(out.right[i]);
+                rms_accum[4] += compute_rms(&sc.left);
+                rms_accum[5] += compute_rms(&sc.right);
+                rms_accum[6] += compute_rms(&sc.left);
+                rms_accum[7] += compute_rms(&sc.right);
+                rms_count_src += 1;
+            } else {
+                match denoiser_src.process_stereo(&sc) {
+                    Ok(out) => {
+                        for i in 0..CHUNK {
+                            src_out.data.push(out.left[i]);
+                            src_out.data.push(out.right[i]);
+                        }
+                        rms_accum[4] += compute_rms(&sc.left);
+                        rms_accum[5] += compute_rms(&sc.right);
+                        rms_accum[6] += compute_rms(&out.left);
+                        rms_accum[7] += compute_rms(&out.right);
+                        rms_count_src += 1;
+                    }
+                    Err(e) => {
+                        log::error!("Denoiser src error: {e}, falling back to bypass");
+                        for i in 0..CHUNK {
+                            src_out.data.push(sc.left[i]);
+                            src_out.data.push(sc.right[i]);
+                        }
+                        rms_accum[4] += compute_rms(&sc.left);
+                        rms_accum[5] += compute_rms(&sc.right);
+                        rms_accum[6] += compute_rms(&sc.left);
+                        rms_accum[7] += compute_rms(&sc.right);
+                        rms_count_src += 1;
+                    }
                 }
             }
         }
@@ -536,17 +583,35 @@ pub fn run_filter(
         pump_write(&mut src_play, &mut src_out);
 
         if last_status.elapsed() >= Duration::from_millis(100) {
-            let (rms_in, rms_out) = if rms_count > 0 {
-                let c = rms_count as f32;
-                let in_rms = ((rms_accum[0] + rms_accum[1]) / (2.0 * c)).sqrt();
-                let out_rms = ((rms_accum[2] + rms_accum[3]) / (2.0 * c)).sqrt();
-                (in_rms, out_rms)
+            let playback_in = if rms_count_sink > 0 {
+                (rms_accum[0] + rms_accum[1]) / (2.0 * rms_count_sink as f32)
             } else {
-                (0.0, 0.0)
+                0.0
             };
-            let _ = status_tx.try_send(Status { rms_in, rms_out });
-            rms_accum = [0.0; 4];
-            rms_count = 0;
+            let playback_out = if rms_count_sink > 0 {
+                (rms_accum[2] + rms_accum[3]) / (2.0 * rms_count_sink as f32)
+            } else {
+                0.0
+            };
+            let recording_in = if rms_count_src > 0 {
+                (rms_accum[4] + rms_accum[5]) / (2.0 * rms_count_src as f32)
+            } else {
+                0.0
+            };
+            let recording_out = if rms_count_src > 0 {
+                (rms_accum[6] + rms_accum[7]) / (2.0 * rms_count_src as f32)
+            } else {
+                0.0
+            };
+            let _ = status_tx.try_send(Status {
+                playback_in,
+                playback_out,
+                recording_in,
+                recording_out,
+            });
+            rms_accum = [0.0; 8];
+            rms_count_sink = 0;
+            rms_count_src = 0;
             last_status = Instant::now();
         }
 

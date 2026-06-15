@@ -71,7 +71,46 @@ mod linux_impl {
 #[cfg(target_os = "linux")]
 pub use linux_impl::run_tray;
 
-#[cfg(not(target_os = "linux"))]
-pub fn run_tray(_done: Arc<AtomicBool>, _ids_tx: Sender<TrayMenuIds>, _enabled: Arc<AtomicBool>) {
-    std::thread::sleep(std::time::Duration::from_secs(u64::MAX));
+#[cfg(target_os = "macos")]
+pub fn create_tray(
+    enabled: &std::sync::atomic::AtomicBool,
+) -> (
+    TrayMenuIds,
+    std::sync::Arc<tray_icon::menu::CheckMenuItem>,
+) {
+    use std::sync::atomic::Ordering;
+
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuItem};
+    use tray_icon::TrayIconBuilder;
+
+    let menu = Menu::new();
+
+    let show_hide = MenuItem::new("Show", true, None);
+    let enabled_item =
+        CheckMenuItem::new("Enabled", true, enabled.load(Ordering::Relaxed), None);
+    let quit = MenuItem::new("Quit", true, None);
+
+    let ids = TrayMenuIds {
+        show_hide: show_hide.id().clone(),
+        enabled: enabled_item.id().clone(),
+        quit: quit.id().clone(),
+    };
+
+    menu.append(&show_hide).expect("append");
+    menu.append(&enabled_item).expect("append");
+    menu.append(&quit).expect("append");
+
+    let icon = tray_icon::Icon::from_rgba(vec![0u8; 64 * 64 * 4], 64, 64).expect("create icon");
+
+    let _tray = TrayIconBuilder::new()
+        .with_tooltip("Upalla")
+        .with_icon(icon)
+        .with_menu(Box::new(menu))
+        .build()
+        .expect("build tray");
+
+    // Keep the tray alive for the program's lifetime.
+    Box::leak(Box::new(_tray));
+
+    (ids, std::sync::Arc::new(enabled_item))
 }

@@ -3,8 +3,10 @@ use upalla_pa::DeviceLists;
 
 pub struct AppGuiState {
     pub bypass: bool,
-    pub rms_in: f32,
-    pub rms_out: f32,
+    pub playback_in: f32,
+    pub playback_out: f32,
+    pub recording_in: f32,
+    pub recording_out: f32,
 
     sinks: Vec<DeviceInfo>,
     sources: Vec<DeviceInfo>,
@@ -19,8 +21,10 @@ impl AppGuiState {
     pub fn new() -> Self {
         AppGuiState {
             bypass: false,
-            rms_in: 0.0,
-            rms_out: 0.0,
+            playback_in: 0.0,
+            playback_out: 0.0,
+            recording_in: 0.0,
+            recording_out: 0.0,
             sinks: Vec::new(),
             sources: Vec::new(),
             default_sink_display: String::new(),
@@ -93,6 +97,27 @@ fn device_combo(
     }
 }
 
+fn db(sample: f32) -> f32 {
+    if sample > 0.0 {
+        20.0 * sample.log10()
+    } else {
+        -60.0
+    }
+}
+
+fn rms_bar(ui: &mut egui::Ui, label: &str, rms: f32) {
+    let db_val = db(rms);
+    let bar_val = ((db_val + 60.0) / 60.0).clamp(0.0, 1.0);
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(
+            egui::ProgressBar::new(bar_val)
+                .text(format!("{:.1} dB", db_val))
+                .desired_width(170.0),
+        );
+    });
+}
+
 #[allow(deprecated)]
 pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
     egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -149,37 +174,13 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
         ui.separator();
         ui.add_space(4.0);
 
-        ui.label("Levels");
+        ui.label("Playback");
+        rms_bar(ui, "Raw:", state.playback_in);
+        rms_bar(ui, "Filtered:", state.playback_out);
 
-        let in_db = if state.rms_in > 0.0 {
-            20.0 * state.rms_in.log10()
-        } else {
-            -60.0
-        };
-        let out_db = if state.rms_out > 0.0 {
-            20.0 * state.rms_out.log10()
-        } else {
-            -60.0
-        };
-
-        ui.horizontal(|ui| {
-            ui.label("In: ");
-            let bar_val = ((in_db + 60.0) / 60.0).clamp(0.0, 1.0);
-            ui.add(
-                egui::ProgressBar::new(bar_val)
-                    .text(format!("{:.1} dB", in_db))
-                    .desired_width(200.0),
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Out:");
-            let bar_val = ((out_db + 60.0) / 60.0).clamp(0.0, 1.0);
-            ui.add(
-                egui::ProgressBar::new(bar_val)
-                    .text(format!("{:.1} dB", out_db))
-                    .desired_width(200.0),
-            );
-        });
+        ui.add_space(6.0);
+        ui.label("Recording");
+        rms_bar(ui, "Raw:", state.recording_in);
+        rms_bar(ui, "Filtered:", state.recording_out);
     });
 }
