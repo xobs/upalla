@@ -45,7 +45,6 @@ pub enum Cmd {
     EnumerateDevices(Sender<DeviceLists>),
     SetSink(String),
     SetSource(String),
-    SetBufferMs(u32),
     Shutdown,
 }
 
@@ -418,7 +417,7 @@ pub fn run_filter(
     let mut sink_out = AudioBuf::new();
     let mut src_in = AudioBuf::new();
     let mut src_out = AudioBuf::new();
-    let mut frame_size = CHUNK * 2; // default 20ms
+    let frame_size = CHUNK * 2; // 20ms at 48kHz
 
     let mut last_status = Instant::now();
     let mut rms_accum = [0.0f32; 4];
@@ -467,21 +466,6 @@ pub fn run_filter(
                     )?;
                     src_in.data.clear();
                     src_in.pos = 0;
-                }
-                Cmd::SetBufferMs(ms) => {
-                    // Compute frame_size in multiples of CHUNK (10ms at 48kHz).
-                    // Minimum 2 chunks (20ms), maximum channels * rate * ms / 1000.
-                    let samples_per_channel = (ms as usize * 48000) / 1000;
-                    let chunks = (samples_per_channel / CHUNK).max(2);
-                    frame_size = chunks * CHUNK * 2;
-                    log::info!(
-                        "Buffer set to {ms}ms → frame_size={frame_size} samples ({chunks} chunks)"
-                    );
-                    // Clear buffers to avoid stale data at old size
-                    sink_out.data.clear();
-                    sink_out.pos = 0;
-                    src_out.data.clear();
-                    src_out.pos = 0;
                 }
                 Cmd::Shutdown => {
                     log::info!("PA filter received shutdown command");

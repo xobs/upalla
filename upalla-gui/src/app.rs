@@ -3,7 +3,6 @@ use upalla_pa::DeviceLists;
 
 pub struct AppGuiState {
     pub bypass: bool,
-    pub buffer_ms: u32,
     pub rms_in: f32,
     pub rms_out: f32,
 
@@ -20,7 +19,6 @@ impl AppGuiState {
     pub fn new() -> Self {
         AppGuiState {
             bypass: false,
-            buffer_ms: 48,
             rms_in: 0.0,
             rms_out: 0.0,
             sinks: Vec::new(),
@@ -135,17 +133,6 @@ pub fn render_gui(ctx: &egui::Context, state: &mut AppGuiState) {
             if ui.button("\u{21bb}").clicked() {
                 state.refresh_devices = true;
             }
-        });
-
-        ui.add_space(6.0);
-
-        ui.horizontal(|ui| {
-            ui.label("Buffer:");
-            ui.add(
-                egui::Slider::new(&mut state.buffer_ms, 10..=500)
-                    .step_by(10.0)
-                    .suffix(" ms"),
-            );
         });
 
         ui.add_space(4.0);

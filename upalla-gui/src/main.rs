@@ -28,7 +28,6 @@ struct UpallaApp {
     status_rx: Receiver<upalla_pa::Status>,
     previous_sink: String,
     previous_source: String,
-    previous_buffer_ms: u32,
     last_device_refresh: Instant,
 }
 
@@ -54,7 +53,6 @@ impl UpallaApp {
             previous_bypass,
             previous_sink: String::new(),
             previous_source: String::new(),
-            previous_buffer_ms: 48,
             last_device_refresh: Instant::now(),
         }
     }
@@ -96,11 +94,6 @@ impl eframe::App for UpallaApp {
         if self.gui_state.selected_source != self.previous_source {
             self.previous_source = self.gui_state.selected_source.clone();
             self.pa.set_source(self.gui_state.selected_source.clone());
-        }
-
-        if self.gui_state.buffer_ms != self.previous_buffer_ms {
-            self.previous_buffer_ms = self.gui_state.buffer_ms;
-            self.pa.set_buffer_ms(self.gui_state.buffer_ms);
         }
 
         // Two-way sync: GUI checkbox → tray thread → PA
