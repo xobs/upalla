@@ -1,0 +1,52 @@
+[package]
+name = "upalla-mac"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Native macOS app for Upalla noise suppression"
+
+[dependencies]
+upalla-core = { path = "../upalla-core" }
+cpal = "0.18"
+ringbuf = "0.4"
+crossbeam-channel = "0.5"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPopUpButton",
+    "NSProgressIndicator",
+    "NSResponder",
+    "NSSlider",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSSwitch",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSData",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+    "NSTimer",
+    "NSThread",
+    "objc2-core-foundation",
+] }

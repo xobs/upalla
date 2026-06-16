@@ -4447,6 +4447,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "upalla-mac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "crossbeam-channel",
+ "env_logger",
+ "image",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "ringbuf",
+ "upalla-core",
+]
+
+[[package]]
 name = "upalla-pa"
 version = "0.1.0"
 dependencies = [
