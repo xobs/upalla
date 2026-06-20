@@ -22,6 +22,10 @@ const SINK_NAME: &str = "upalla_sink";
 const SRC_SINK_NAME: &str = "upalla_src_sink";
 const SRC_VIRTUAL_NAME: &str = "upalla_virtual";
 const REMAINDER_CAP: usize = 16384;
+/// Maximum number of stereo frames to buffer unprocessed.
+/// Beyond this, the oldest frames are dropped to bound latency.
+const MAX_BUFFER_FRAMES: usize = 8;
+const FRAME_SIZE: usize = CHUNK * 2; // 960 f32 samples = 480 stereo samples = 10ms at 48kHz
 
 pub struct Status {
     pub playback_in: f32,
@@ -94,6 +98,22 @@ impl AudioBuf {
             self.pos = 0;
         }
         chunk
+    }
+    /// Drop oldest whole frames if total unprocessed samples exceed the max.
+    fn drop_excess(&mut self) {
+        let max_samples = MAX_BUFFER_FRAMES * FRAME_SIZE;
+        let excess = self.len().saturating_sub(max_samples);
+        if excess > 0 {
+            let drop_samples = (excess / FRAME_SIZE) * FRAME_SIZE;
+            if drop_samples > 0 {
+                log::debug!("Dropping {drop_samples} samples to bound latency");
+                self.pos += drop_samples;
+                if self.pos > REMAINDER_CAP {
+                    self.data.drain(..self.pos);
+                    self.pos = 0;
+                }
+            }
+        }
     }
 }
 
@@ -421,7 +441,6 @@ pub fn run_filter(
     let mut sink_out = AudioBuf::new();
     let mut src_in = AudioBuf::new();
     let mut src_out = AudioBuf::new();
-    let frame_size = CHUNK * 2; // 20ms at 48kHz
 
     let mut last_status = Instant::now();
     let mut rms_accum = [0.0f32; 8];
@@ -482,9 +501,13 @@ pub fn run_filter(
         pump_read(&mut sink_rec, &mut sink_in);
         pump_read(&mut src_rec, &mut src_in);
 
+        // Drop excess input to bound latency when processing falls behind
+        sink_in.drop_excess();
+        src_in.drop_excess();
+
         let is_bypass = !enable.load(Ordering::Relaxed);
 
-        while let Some(frame) = sink_in.drain_frames(frame_size) {
+        if let Some(frame) = sink_in.drain_frames(FRAME_SIZE) {
             let mut sc = StereoChunk {
                 left: [0.0; CHUNK],
                 right: [0.0; CHUNK],
@@ -531,7 +554,7 @@ pub fn run_filter(
                 }
             }
         }
-        while let Some(frame) = src_in.drain_frames(frame_size) {
+        if let Some(frame) = src_in.drain_frames(FRAME_SIZE) {
             let mut sc = StereoChunk {
                 left: [0.0; CHUNK],
                 right: [0.0; CHUNK],
@@ -619,8 +642,8 @@ pub fn run_filter(
             IterateResult::Quit(_) | IterateResult::Err(_) => break,
             _ => {}
         }
-        if sink_in.len() < frame_size
-            && src_in.len() < frame_size
+        if sink_in.len() < FRAME_SIZE
+            && src_in.len() < FRAME_SIZE
             && sink_out.len() == 0
             && src_out.len() == 0
         {
