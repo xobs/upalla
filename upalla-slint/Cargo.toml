@@ -1,0 +1,20 @@
+[package]
+name = "upalla-slint"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Slint GUI for Upalla noise suppression"
+
+[dependencies]
+upalla-core = { path = "../upalla-core" }
+upalla-pa = { path = "../upalla-pa" }
+slint = { version = "1.16", features = ["compat-1-0"] }
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+crossbeam-channel = "0.5"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+slint-build = "1.16"

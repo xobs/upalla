@@ -1,0 +1,142 @@
+import { ComboBox, CheckBox, ProgressIndicator, Button, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component UpallaWindow inherits Window {
+    title: "Upalla";
+    preferred-width: 420px;
+    preferred-height: 520px;
+
+    in-out property <[string]> sinks: [];
+    in-out property <[string]> sources: [];
+    in-out property <int> sink-index: 0;
+    in-out property <int> source-index: 0;
+    in-out property <bool> playback-enabled: true;
+    in-out property <bool> recording-enabled: true;
+    in-out property <float> playback-in-level: 0.0;
+    in-out property <float> playback-out-level: 0.0;
+    in-out property <float> recording-in-level: 0.0;
+    in-out property <float> recording-out-level: 0.0;
+    in-out property <string> playback-in-db: "-60.0 dB";
+    in-out property <string> playback-out-db: "-60.0 dB";
+    in-out property <string> recording-in-db: "-60.0 dB";
+    in-out property <string> recording-out-db: "-60.0 dB";
+
+    callback refresh();
+
+    VerticalBox {
+        spacing: 4px;
+        padding: 10px;
+
+        Text {
+            text: "Upalla \u{2014} Real-time Denoising";
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        HorizontalBox {
+            spacing: 6px;
+            Text {
+                text: "Output:";
+            }
+            ComboBox {
+                model: root.sinks;
+                current-index: root.sink-index;
+            }
+            Button {
+                text: "\u{21bb}";
+                clicked => { root.refresh(); }
+            }
+        }
+
+        HorizontalBox {
+            spacing: 6px;
+            Text {
+                text: "Input:";
+            }
+            ComboBox {
+                model: root.sources;
+                current-index: root.source-index;
+            }
+        }
+
+        Rectangle {
+            height: 0px;
+            vertical-stretch: 1;
+        }
+
+        Text {
+            text: "Playback";
+            font-size: 14px;
+            font-weight: 700;
+        }
+        CheckBox {
+            text: "Enabled";
+            checked: root.playback-enabled;
+        }
+
+        HorizontalBox {
+            spacing: 6px;
+            Text {
+                text: "Raw:";
+            }
+            ProgressIndicator {
+                indeterminate: false;
+                progress: root.playback-in-level;
+            }
+            Text {
+                text: root.playback-in-db;
+            }
+        }
+
+        HorizontalBox {
+            spacing: 6px;
+            Text {
+                text: "Filtered:";
+            }
+            ProgressIndicator {
+                indeterminate: false;
+                progress: root.playback-out-level;
+            }
+            Text {
+                text: root.playback-out-db;
+            }
+        }
+
+        Text {
+            text: "Recording";
+            font-size: 14px;
+            font-weight: 700;
+        }
+        CheckBox {
+            text: "Enabled";
+            checked: root.recording-enabled;
+        }
+
+        HorizontalBox {
+            spacing: 6px;
+            Text {
+                text: "Raw:";
+            }
+            ProgressIndicator {
+                indeterminate: false;
+                progress: root.recording-in-level;
+            }
+            Text {
+                text: root.recording-in-db;
+            }
+        }
+
+        HorizontalBox {
+            spacing: 6px;
+            Text {
+                text: "Filtered:";
+            }
+            ProgressIndicator {
+                indeterminate: false;
+                progress: root.recording-out-level;
+            }
+            Text {
+                text: root.recording-out-db;
+            }
+        }
+    }
+}
