@@ -2,15 +2,18 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use gtk4::prelude::*;
+use ksni::blocking::TrayMethods;
 use upalla_core::model::Model;
 use upalla_pa::{PaFilter, Status};
+
+mod icon;
 
 fn db_val(sample: f32) -> f32 {
     if sample > 0.0 {
@@ -22,6 +25,7 @@ fn db_val(sample: f32) -> f32 {
 
 struct AppState {
     status_rx: Receiver<Status>,
+    show_rx: Receiver<()>,
     previous_sink_idx: u32,
     previous_source_idx: u32,
     previous_bypass: bool,
@@ -40,7 +44,12 @@ struct AppState {
 }
 
 impl AppState {
-    fn update_levels(&mut self, pa: &PaFilter) {
+    fn update_levels(&mut self, pa: &PaFilter, window: &gtk4::ApplicationWindow) {
+        // Handle show requests from tray
+        while self.show_rx.try_recv().is_ok() {
+            window.present();
+        }
+
         while let Ok(status) = self.status_rx.try_recv() {
             self.update_bar(
                 &self.playback_in_bar, &self.playback_in_label, status.playback_in,
@@ -126,7 +135,6 @@ impl AppState {
             self.source_combo.append_text(&d.description);
         }
 
-        // Always select the previously active index; on first call index 0 = "Default"
         self.sink_combo.set_active(Some(self.previous_sink_idx));
         self.source_combo.set_active(Some(self.previous_source_idx));
     }
@@ -245,6 +253,7 @@ fn build_window(
 
     let state = AppState {
         status_rx: crossbeam_channel::unbounded().1,
+        show_rx: crossbeam_channel::unbounded().1,
         previous_sink_idx: 0,
         previous_source_idx: 0,
         previous_bypass: false,
@@ -265,6 +274,75 @@ fn build_window(
     (window, state)
 }
 
+struct UpallaTray {
+    pa: Arc<PaFilter>,
+    enabled: Arc<AtomicBool>,
+    show_tx: Sender<()>,
+}
+
+impl ksni::Tray for UpallaTray {
+    fn id(&self) -> String {
+        "upalla".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![icon::tray_icon()]
+    }
+
+    fn title(&self) -> String {
+        "Upalla".into()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.show_tx.send(());
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::*;
+        vec![
+            StandardItem {
+                label: "Show".into(),
+                enabled: true,
+                activate: {
+                    let tx = self.show_tx.clone();
+                    Box::new(move |_: &mut Self| {
+                        let _ = tx.send(());
+                    })
+                },
+                ..Default::default()
+            }.into(),
+            CheckmarkItem {
+                label: "Enabled".into(),
+                checked: self.enabled.load(Ordering::Relaxed),
+                enabled: true,
+                activate: {
+                    let pa = self.pa.clone();
+                    let flag = self.enabled.clone();
+                    Box::new(move |_tray: &mut Self| {
+                        let new_state = !flag.load(Ordering::Relaxed);
+                        flag.store(new_state, Ordering::Relaxed);
+                        pa.set_bypass(!new_state);
+                    })
+                },
+                ..Default::default()
+            }.into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "Quit".into(),
+                enabled: true,
+                activate: {
+                    let pa = self.pa.clone();
+                    Box::new(move |_: &mut Self| {
+                        pa.shutdown();
+                        std::process::exit(0);
+                    })
+                },
+                ..Default::default()
+            }.into(),
+        ]
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     log::info!("Starting Upalla GTK4...");
@@ -272,16 +350,33 @@ fn main() -> Result<()> {
     let enabled = Arc::new(AtomicBool::new(true));
     let pa = Arc::new(PaFilter::new(Model::DeepFilterNet3Ll, Arc::clone(&enabled))?);
     let status_rx = pa.status_receiver().clone();
+    let (show_tx, show_rx) = unbounded();
 
     let app = gtk4::Application::builder()
         .application_id("io.github.upalla")
         .build();
+
+    let show_rx_cell = Rc::new(RefCell::new(Some(show_rx)));
 
     app.connect_activate({
         let pa = pa.clone();
         move |app| {
             let (window, mut state) = build_window(app);
             state.status_rx = status_rx.clone();
+            state.show_rx = show_rx_cell.borrow_mut().take().expect("activate called twice");
+
+            // Set dock icon when the window surface is available
+            {
+                let icon_pixbuf = icon::icon_pixbuf();
+                window.connect_realize(move |win| {
+                    if let Some(surface) = win.surface() {
+                        if let Ok(toplevel) = surface.downcast::<gtk4::gdk::Toplevel>() {
+                            let texture = gtk4::gdk::Texture::for_pixbuf(&icon_pixbuf);
+                            toplevel.set_icon_list(&[texture]);
+                        }
+                    }
+                });
+            }
 
             let state = Rc::new(RefCell::new(state));
 
@@ -289,8 +384,9 @@ fn main() -> Result<()> {
             {
                 let state = state.clone();
                 let pa = pa.clone();
+                let window = window.clone();
                 gtk4::glib::timeout_add_local(Duration::from_millis(250), move || {
-                    state.borrow_mut().update_levels(&pa);
+                    state.borrow_mut().update_levels(&pa, &window);
                     gtk4::glib::ControlFlow::Continue
                 });
             }
@@ -340,6 +436,15 @@ fn main() -> Result<()> {
             });
         }
     });
+
+    // Tray — spawned before event loop so it's ready when the window appears
+    let tray = UpallaTray {
+        pa: pa.clone(),
+        enabled: enabled.clone(),
+        show_tx,
+    };
+
+    let _handle = tray.spawn().expect("ksni tray service");
 
     app.run();
     Ok(())
