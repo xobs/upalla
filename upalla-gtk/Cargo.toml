@@ -9,7 +9,7 @@ description = "GTK4 GUI for Upalla noise suppression"
 upalla-core = { path = "../upalla-core" }
 upalla-pa = { path = "../upalla-pa" }
 gtk4 = { version = "0.11", features = ["v4_22"] }
-ksni = { version = "0.3", features = ["blocking"] }
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 crossbeam-channel = "0.5"
 anyhow = "1"
 log = "0.4"
