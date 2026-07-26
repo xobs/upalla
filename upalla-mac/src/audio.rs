@@ -25,15 +25,11 @@ pub struct Status {
 #[derive(Clone)]
 pub struct DeviceInfo {
     pub name: String,
-    pub description: String,
 }
-
 #[derive(Clone)]
 pub struct DeviceLists {
     pub sinks: Vec<DeviceInfo>,
     pub sources: Vec<DeviceInfo>,
-    pub default_sink: String,
-    pub default_source: String,
 }
 
 pub enum Cmd {
@@ -122,26 +118,12 @@ fn device_name(device: &cpal::Device) -> String {
 
 pub fn enumerate_devices() -> Result<DeviceLists> {
     let host = cpal::default_host();
-    let default_sink = host
-        .default_output_device()
-        .as_ref()
-        .map(|d| device_name(d))
-        .unwrap_or_default();
-    let default_source = host
-        .default_input_device()
-        .as_ref()
-        .map(|d| device_name(d))
-        .unwrap_or_default();
-
     let sinks: Vec<DeviceInfo> = host
         .output_devices()
         .context("enumerate output devices")?
         .map(|d| {
             let name = device_name(&d);
-            DeviceInfo {
-                name: name.clone(),
-                description: name,
-            }
+            DeviceInfo { name }
         })
         .collect();
 
@@ -150,10 +132,7 @@ pub fn enumerate_devices() -> Result<DeviceLists> {
         .context("enumerate input devices")?
         .map(|d| {
             let name = device_name(&d);
-            DeviceInfo {
-                name: name.clone(),
-                description: name,
-            }
+            DeviceInfo { name }
         })
         .collect();
 
@@ -166,8 +145,6 @@ pub fn enumerate_devices() -> Result<DeviceLists> {
     Ok(DeviceLists {
         sinks,
         sources,
-        default_sink,
-        default_source,
     })
 }
 

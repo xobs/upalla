@@ -11,6 +11,7 @@ use objc2_foundation::{MainThreadMarker, NSSize, NSString};
 use crate::icon;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Tray {
     pub item: Retained<NSStatusItem>,
     pub enabled_item: Retained<NSMenuItem>,
