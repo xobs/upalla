@@ -42,13 +42,15 @@ pub fn create_tray(mtm: MainThreadMarker, target: &AnyObject) -> Tray {
     let quit_item = make_item(mtm, "Quit Upalla", target, sel!(quitApp:));
     menu.addItem(&quit_item);
 
-    Tray {
-        item,
-        enabled_item,
-    }
+    Tray { item, enabled_item }
 }
 
-fn make_item(mtm: MainThreadMarker, title: &str, target: &AnyObject, action: Sel) -> Retained<NSMenuItem> {
+fn make_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    target: &AnyObject,
+    action: Sel,
+) -> Retained<NSMenuItem> {
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),

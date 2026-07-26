@@ -52,16 +52,24 @@ impl AppState {
 
         while let Ok(status) = self.status_rx.try_recv() {
             self.update_bar(
-                &self.playback_in_bar, &self.playback_in_label, status.playback_in,
+                &self.playback_in_bar,
+                &self.playback_in_label,
+                status.playback_in,
             );
             self.update_bar(
-                &self.playback_out_bar, &self.playback_out_label, status.playback_out,
+                &self.playback_out_bar,
+                &self.playback_out_label,
+                status.playback_out,
             );
             self.update_bar(
-                &self.recording_in_bar, &self.recording_in_label, status.recording_in,
+                &self.recording_in_bar,
+                &self.recording_in_label,
+                status.recording_in,
             );
             self.update_bar(
-                &self.recording_out_bar, &self.recording_out_label, status.recording_out,
+                &self.recording_out_bar,
+                &self.recording_out_label,
+                status.recording_out,
             );
         }
 
@@ -125,12 +133,14 @@ impl AppState {
         self.sink_combo.remove_all();
         self.source_combo.remove_all();
 
-        self.sink_combo.append_text(&format!("Default ({})", default_sink_display));
+        self.sink_combo
+            .append_text(&format!("Default ({})", default_sink_display));
         for d in &devices.sinks {
             self.sink_combo.append_text(&d.description);
         }
 
-        self.source_combo.append_text(&format!("Default ({})", default_source_display));
+        self.source_combo
+            .append_text(&format!("Default ({})", default_source_display));
         for d in &devices.sources {
             self.source_combo.append_text(&d.description);
         }
@@ -162,9 +172,7 @@ fn make_bar_row(label: &str) -> (gtk4::ProgressBar, gtk4::Label, gtk4::Box) {
     (bar, val, row)
 }
 
-fn build_window(
-    app: &gtk4::Application,
-) -> (gtk4::ApplicationWindow, AppState) {
+fn build_window(app: &gtk4::Application) -> (gtk4::ApplicationWindow, AppState) {
     let window = gtk4::ApplicationWindow::builder()
         .application(app)
         .title("Upalla")
@@ -310,7 +318,8 @@ impl ksni::Tray for UpallaTray {
                     })
                 },
                 ..Default::default()
-            }.into(),
+            }
+            .into(),
             CheckmarkItem {
                 label: "Enabled".into(),
                 checked: self.enabled.load(Ordering::Relaxed),
@@ -325,7 +334,8 @@ impl ksni::Tray for UpallaTray {
                     })
                 },
                 ..Default::default()
-            }.into(),
+            }
+            .into(),
             MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),
@@ -338,7 +348,8 @@ impl ksni::Tray for UpallaTray {
                     })
                 },
                 ..Default::default()
-            }.into(),
+            }
+            .into(),
         ]
     }
 }
@@ -348,7 +359,10 @@ fn main() -> Result<()> {
     log::info!("Starting Upalla GTK4...");
 
     let enabled = Arc::new(AtomicBool::new(true));
-    let pa = Arc::new(PaFilter::new(Model::DeepFilterNet3Ll, Arc::clone(&enabled))?);
+    let pa = Arc::new(PaFilter::new(
+        Model::DeepFilterNet3Ll,
+        Arc::clone(&enabled),
+    )?);
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();
 
@@ -363,7 +377,10 @@ fn main() -> Result<()> {
         move |app| {
             let (window, mut state) = build_window(app);
             state.status_rx = status_rx.clone();
-            state.show_rx = show_rx_cell.borrow_mut().take().expect("activate called twice");
+            state.show_rx = show_rx_cell
+                .borrow_mut()
+                .take()
+                .expect("activate called twice");
 
             // Set dock icon when the window surface is available
             {
@@ -405,15 +422,12 @@ fn main() -> Result<()> {
             {
                 let state = state.clone();
                 let pa = pa.clone();
-                if let Some(outer) = window
-                    .child()
-                    .and_then(|c| c.downcast::<gtk4::Box>().ok())
-                {
-                    if let Some(out_row) = nth_child(&outer, 1)
-                        .and_then(|c| c.downcast::<gtk4::Box>().ok())
+                if let Some(outer) = window.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
+                    if let Some(out_row) =
+                        nth_child(&outer, 1).and_then(|c| c.downcast::<gtk4::Box>().ok())
                     {
-                        if let Some(btn) = nth_child(&out_row, 2)
-                            .and_then(|c| c.downcast::<gtk4::Button>().ok())
+                        if let Some(btn) =
+                            nth_child(&out_row, 2).and_then(|c| c.downcast::<gtk4::Button>().ok())
                         {
                             btn.connect_clicked(move |_| {
                                 state.borrow_mut().populate_devices(&pa);

@@ -12,6 +12,8 @@ use ringbuf::HeapRb;
 
 const REMAINDER_CAP: usize = 16384;
 const RINGBUF_CAP: usize = 16384;
+const MAX_BUFFER_FRAMES: usize = 8;
+const FRAME_SIZE: usize = CHUNK * 2; // 960 f32 = 480 stereo frames = 10ms at 48kHz
 
 pub struct Status {
     pub playback_in: f32,
@@ -88,6 +90,21 @@ impl AudioBuf {
             self.pos = 0;
         }
         chunk
+    }
+    fn drop_excess(&mut self) {
+        let max_samples = MAX_BUFFER_FRAMES * FRAME_SIZE;
+        let excess = self.len().saturating_sub(max_samples);
+        if excess > 0 {
+            let drop_samples = (excess / FRAME_SIZE) * FRAME_SIZE;
+            if drop_samples > 0 {
+                log::debug!("Dropping {drop_samples} samples to bound latency");
+                self.pos += drop_samples;
+                if self.pos > REMAINDER_CAP {
+                    self.data.drain(..self.pos);
+                    self.pos = 0;
+                }
+            }
+        }
     }
 }
 
@@ -173,9 +190,7 @@ fn find_input_by_name(name: &str) -> Option<cpal::Device> {
     if name == "@DEFAULT_SOURCE@" || name.is_empty() {
         return host.default_input_device();
     }
-    host.input_devices()
-        .ok()?
-        .find(|d| device_matches(d, name))
+    host.input_devices().ok()?.find(|d| device_matches(d, name))
 }
 
 fn find_blackhole_output() -> Option<cpal::Device> {
@@ -265,8 +280,7 @@ fn process_chain(
     rms_out_accum: &mut f32,
     rms_count: &mut u32,
 ) {
-    while let Some(frame) = audio_in.drain_frames(frame_size) {
-
+    if let Some(frame) = audio_in.drain_frames(frame_size) {
         let mut sc = StereoChunk {
             left: [0.0; CHUNK],
             right: [0.0; CHUNK],
@@ -426,7 +440,10 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut temp_buf = vec![0.0f32; 4096];
     let mut shutdown = false;
 
-    log::info!("Audio processing loop running (has_playback={})", has_playback);
+    log::info!(
+        "Audio processing loop running (has_playback={})",
+        has_playback
+    );
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -492,6 +509,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
             if let Some(ref mut c) = pb_in_cons {
                 pump_input(c, &mut pb_audio_in, &mut temp_buf);
             }
+            pb_audio_in.drop_excess();
             process_chain(
                 &mut pb_audio_in,
                 &mut pb_audio_out,
@@ -508,6 +526,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
         }
 
         pump_input(&mut rec_in_cons, &mut rec_audio_in, &mut temp_buf);
+        rec_audio_in.drop_excess();
         process_chain(
             &mut rec_audio_in,
             &mut rec_audio_out,
@@ -566,8 +585,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
             last_status = Instant::now();
         }
 
-        let pb_idle = !has_playback
-            || (pb_audio_in.len() < frame_size && pb_audio_out.len() == 0);
+        let pb_idle = !has_playback || (pb_audio_in.len() < frame_size && pb_audio_out.len() == 0);
         let rec_idle = rec_audio_in.len() < frame_size && rec_audio_out.len() == 0;
         if pb_idle && rec_idle {
             std::thread::sleep(Duration::from_micros(500));

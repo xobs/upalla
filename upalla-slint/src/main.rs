@@ -1,11 +1,12 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use ksni::blocking::TrayMethods;
 use slint::{ComponentHandle, Timer, TimerMode, VecModel};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use upalla_core::model::Model;
 use upalla_pa::PaFilter;
 
@@ -56,7 +57,9 @@ fn update_levels(state: &mut SharedState) {
         if sink_idx != state.previous_sink_idx {
             state.previous_sink_idx = sink_idx;
             if sink_idx > 0 && (sink_idx as usize) < state.sink_descriptions.len() {
-                state.pa.set_sink(state.sink_descriptions[sink_idx as usize].clone());
+                state
+                    .pa
+                    .set_sink(state.sink_descriptions[sink_idx as usize].clone());
             }
         }
 
@@ -64,7 +67,9 @@ fn update_levels(state: &mut SharedState) {
         if source_idx != state.previous_source_idx {
             state.previous_source_idx = source_idx;
             if source_idx > 0 && (source_idx as usize) < state.source_descriptions.len() {
-                state.pa.set_source(state.source_descriptions[source_idx as usize].clone());
+                state
+                    .pa
+                    .set_source(state.source_descriptions[source_idx as usize].clone());
             }
         }
 
@@ -96,9 +101,8 @@ fn show_or_create(state: &mut SharedState) {
             win.set_recording_enabled(true);
 
             // Close → destroy
-            win.window().on_close_requested(move || {
-                slint::CloseRequestResponse::HideWindow
-            });
+            win.window()
+                .on_close_requested(move || slint::CloseRequestResponse::HideWindow);
 
             // Refresh button
             win.on_refresh({
@@ -124,11 +128,15 @@ fn populate_window(pa: &PaFilter, win: &UpallaWindow) {
     let mut sources: Vec<slint::SharedString> = Vec::new();
 
     let default_sink_display = devices
-        .sinks.iter().find(|d| d.name == devices.default_sink)
+        .sinks
+        .iter()
+        .find(|d| d.name == devices.default_sink)
         .map(|d| d.description.clone())
         .unwrap_or_else(|| devices.default_sink.clone());
     let default_source_display = devices
-        .sources.iter().find(|d| d.name == devices.default_source)
+        .sources
+        .iter()
+        .find(|d| d.name == devices.default_source)
         .map(|d| d.description.clone())
         .unwrap_or_else(|| devices.default_source.clone());
 
@@ -154,9 +162,15 @@ struct UpallaTray {
 }
 
 impl ksni::Tray for UpallaTray {
-    fn id(&self) -> String { "upalla".into() }
-    fn icon_pixmap(&self) -> Vec<ksni::Icon> { vec![icon::tray_icon()] }
-    fn title(&self) -> String { "Upalla".into() }
+    fn id(&self) -> String {
+        "upalla".into()
+    }
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![icon::tray_icon()]
+    }
+    fn title(&self) -> String {
+        "Upalla".into()
+    }
 
     fn activate(&mut self, _x: i32, _y: i32) {
         let _ = self.show_tx.send(());
@@ -166,13 +180,17 @@ impl ksni::Tray for UpallaTray {
         use ksni::menu::*;
         vec![
             StandardItem {
-                label: "Show".into(), enabled: true,
+                label: "Show".into(),
+                enabled: true,
                 activate: {
                     let tx = self.show_tx.clone();
-                    Box::new(move |_: &mut Self| { let _ = tx.send(()); })
+                    Box::new(move |_: &mut Self| {
+                        let _ = tx.send(());
+                    })
                 },
                 ..Default::default()
-            }.into(),
+            }
+            .into(),
             CheckmarkItem {
                 label: "Enabled".into(),
                 checked: self.enabled.load(Ordering::Relaxed),
@@ -187,10 +205,12 @@ impl ksni::Tray for UpallaTray {
                     })
                 },
                 ..Default::default()
-            }.into(),
+            }
+            .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Quit".into(), enabled: true,
+                label: "Quit".into(),
+                enabled: true,
                 activate: {
                     let pa = self.pa.clone();
                     Box::new(move |_: &mut Self| {
@@ -199,21 +219,20 @@ impl ksni::Tray for UpallaTray {
                     })
                 },
                 ..Default::default()
-            }.into(),
+            }
+            .into(),
         ]
     }
 }
 
 fn main() -> Result<()> {
     env_logger::init();
-    log::info!("Starting Upalla Slint...");
-
     let enabled = Arc::new(AtomicBool::new(true));
     let pa = Arc::new(PaFilter::new(Model::default(), Arc::clone(&enabled))?);
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();
 
-    let state = Arc::new(Mutex::new(SharedState {
+    let state = Rc::new(RefCell::new(SharedState {
         pa: pa.clone(),
         status_rx,
         previous_sink_idx: 0,
@@ -234,8 +253,7 @@ fn main() -> Result<()> {
         let rx: Receiver<()> = show_rx;
         let t = Timer::default();
         t.start(TimerMode::Repeated, Duration::from_millis(250), move || {
-            #[allow(unused_mut)]
-            let mut s = state.lock().unwrap();
+            let mut s = state.borrow_mut();
             // Process show requests (create window if needed)
             while let Ok(()) = rx.try_recv() {
                 show_or_create(&mut s);
@@ -256,8 +274,7 @@ fn main() -> Result<()> {
         let state = state.clone();
         let t = Timer::default();
         t.start(TimerMode::Repeated, Duration::from_secs(1), move || {
-            #[allow(unused_mut)]
-            let mut s = state.lock().unwrap();
+            let s = state.borrow_mut();
             if let Some(ref win) = s.window {
                 populate_window(&s.pa, win);
             }
@@ -266,8 +283,13 @@ fn main() -> Result<()> {
     }
 
     // Tray
-    UpallaTray { pa: pa.clone(), enabled: enabled.clone(), show_tx }
-        .spawn().expect("ksni tray service");
+    UpallaTray {
+        pa: pa.clone(),
+        enabled: enabled.clone(),
+        show_tx,
+    }
+    .spawn()
+    .expect("ksni tray service");
 
     log::info!("entering event loop");
     slint::run_event_loop_until_quit()?;

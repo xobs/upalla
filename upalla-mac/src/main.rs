@@ -6,13 +6,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSBackingStoreType, NSControlStateValueOff, NSControlStateValueOn,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSControlStateValueOff, NSControlStateValueOn, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSTimer,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSTimer,
 };
 
 mod audio;
@@ -208,7 +207,11 @@ define_class!(
 );
 
 impl AppDelegate {
-    fn new(mtm: MainThreadMarker, cmd_tx: Sender<Cmd>, status_rx: Receiver<Status>) -> Retained<Self> {
+    fn new(
+        mtm: MainThreadMarker,
+        cmd_tx: Sender<Cmd>,
+        status_rx: Receiver<Status>,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
             cmd_tx,
             status_rx: RefCell::new(status_rx),

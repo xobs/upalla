@@ -3,8 +3,8 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::sel;
 use objc2::MainThreadOnly;
 use objc2_app_kit::{
-    NSBezelStyle, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSPopUpButton, NSSlider, NSTextField, NSView,
+    NSBezelStyle, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSPopUpButton,
+    NSSlider, NSTextField, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
@@ -25,10 +25,7 @@ pub struct Controls {
 }
 
 fn label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
-    let tf = NSTextField::labelWithString(
-        &NSString::from_str(text),
-        mtm,
-    );
+    let tf = NSTextField::labelWithString(&NSString::from_str(text), mtm);
     tf.setEditable(false);
     tf.setSelectable(false);
     tf.setBordered(false);
@@ -66,11 +63,7 @@ fn make_popup(mtm: MainThreadMarker, target: &AnyObject, action: Sel) -> Retaine
     p
 }
 
-pub fn build_controls(
-    mtm: MainThreadMarker,
-    view: &NSView,
-    target: &AnyObject,
-) -> Controls {
+pub fn build_controls(mtm: MainThreadMarker, view: &NSView, target: &AnyObject) -> Controls {
     let out_label = label(mtm, "Output:");
     let sink_popup = make_popup(mtm, target, sel!(sinkSelected:));
     let refresh_out = make_button(mtm, target, sel!(refreshDevices:), "\u{21bb}");
@@ -126,14 +119,27 @@ pub fn build_controls(
     view.addSubview(&rec_filt_label);
 
     layout_controls(
-        &out_label, &sink_popup, &refresh_out,
-        &in_label, &source_popup, &refresh_in,
+        &out_label,
+        &sink_popup,
+        &refresh_out,
+        &in_label,
+        &source_popup,
+        &refresh_in,
         &enabled_checkbox,
-        &pb_header, &rec_header,
-        &pb_raw_title, &pb_raw_slider, &pb_raw_label,
-        &pb_filt_title, &pb_filt_slider, &pb_filt_label,
-        &rec_raw_title, &rec_raw_slider, &rec_raw_label,
-        &rec_filt_title, &rec_filt_slider, &rec_filt_label,
+        &pb_header,
+        &rec_header,
+        &pb_raw_title,
+        &pb_raw_slider,
+        &pb_raw_label,
+        &pb_filt_title,
+        &pb_filt_slider,
+        &pb_filt_label,
+        &rec_raw_title,
+        &rec_raw_slider,
+        &rec_raw_label,
+        &rec_filt_title,
+        &rec_filt_slider,
+        &rec_filt_label,
     );
 
     Controls {
@@ -169,11 +175,7 @@ fn make_button(
     b
 }
 
-fn make_checkbox(
-    mtm: MainThreadMarker,
-    target: &AnyObject,
-    action: Sel,
-) -> Retained<NSButton> {
+fn make_checkbox(mtm: MainThreadMarker, target: &AnyObject, action: Sel) -> Retained<NSButton> {
     let b = unsafe {
         NSButton::checkboxWithTitle_target_action(
             &NSString::from_str("Enabled"),
@@ -222,51 +224,126 @@ fn layout_controls(
 
     let mut y: f64 = 380.0;
 
-    out_label.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(label_w, row_h)));
-    sink_popup.setFrame(NSRect::new(NSPoint::new(margin + label_w + gap, y), NSSize::new(popup_w, row_h)));
-    refresh_out.setFrame(NSRect::new(NSPoint::new(margin + label_w + gap + popup_w + gap, y), NSSize::new(btn_w, row_h)));
+    out_label.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(label_w, row_h),
+    ));
+    sink_popup.setFrame(NSRect::new(
+        NSPoint::new(margin + label_w + gap, y),
+        NSSize::new(popup_w, row_h),
+    ));
+    refresh_out.setFrame(NSRect::new(
+        NSPoint::new(margin + label_w + gap + popup_w + gap, y),
+        NSSize::new(btn_w, row_h),
+    ));
     y -= row_h + gap;
 
-    in_label.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(label_w, row_h)));
-    source_popup.setFrame(NSRect::new(NSPoint::new(margin + label_w + gap, y), NSSize::new(popup_w, row_h)));
-    refresh_in.setFrame(NSRect::new(NSPoint::new(margin + label_w + gap + popup_w + gap, y), NSSize::new(btn_w, row_h)));
+    in_label.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(label_w, row_h),
+    ));
+    source_popup.setFrame(NSRect::new(
+        NSPoint::new(margin + label_w + gap, y),
+        NSSize::new(popup_w, row_h),
+    ));
+    refresh_in.setFrame(NSRect::new(
+        NSPoint::new(margin + label_w + gap + popup_w + gap, y),
+        NSSize::new(btn_w, row_h),
+    ));
     y -= row_h + gap * 2.0;
 
-    enabled_checkbox.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(100.0, row_h)));
+    enabled_checkbox.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(100.0, row_h),
+    ));
     y -= row_h + gap * 2.0;
 
-    pb_header.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(100.0, row_h)));
+    pb_header.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(100.0, row_h),
+    ));
     y -= row_h + gap;
 
-    pb_raw_title.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(rms_title_w, row_h)));
-    pb_raw_slider.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap, y), NSSize::new(bar_w, row_h)));
-    pb_raw_label.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y), NSSize::new(db_w, row_h)));
+    pb_raw_title.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(rms_title_w, row_h),
+    ));
+    pb_raw_slider.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap, y),
+        NSSize::new(bar_w, row_h),
+    ));
+    pb_raw_label.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y),
+        NSSize::new(db_w, row_h),
+    ));
     y -= row_h + gap;
 
-    pb_filt_title.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(rms_title_w, row_h)));
-    pb_filt_slider.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap, y), NSSize::new(bar_w, row_h)));
-    pb_filt_label.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y), NSSize::new(db_w, row_h)));
+    pb_filt_title.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(rms_title_w, row_h),
+    ));
+    pb_filt_slider.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap, y),
+        NSSize::new(bar_w, row_h),
+    ));
+    pb_filt_label.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y),
+        NSSize::new(db_w, row_h),
+    ));
     y -= row_h + gap * 2.0;
 
-    rec_header.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(100.0, row_h)));
+    rec_header.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(100.0, row_h),
+    ));
     y -= row_h + gap;
 
-    rec_raw_title.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(rms_title_w, row_h)));
-    rec_raw_slider.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap, y), NSSize::new(bar_w, row_h)));
-    rec_raw_label.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y), NSSize::new(db_w, row_h)));
+    rec_raw_title.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(rms_title_w, row_h),
+    ));
+    rec_raw_slider.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap, y),
+        NSSize::new(bar_w, row_h),
+    ));
+    rec_raw_label.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y),
+        NSSize::new(db_w, row_h),
+    ));
     y -= row_h + gap;
 
-    rec_filt_title.setFrame(NSRect::new(NSPoint::new(margin, y), NSSize::new(rms_title_w, row_h)));
-    rec_filt_slider.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap, y), NSSize::new(bar_w, row_h)));
-    rec_filt_label.setFrame(NSRect::new(NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y), NSSize::new(db_w, row_h)));
+    rec_filt_title.setFrame(NSRect::new(
+        NSPoint::new(margin, y),
+        NSSize::new(rms_title_w, row_h),
+    ));
+    rec_filt_slider.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap, y),
+        NSSize::new(bar_w, row_h),
+    ));
+    rec_filt_label.setFrame(NSRect::new(
+        NSPoint::new(margin + rms_title_w + gap + bar_w + gap, y),
+        NSSize::new(db_w, row_h),
+    ));
 }
 
 impl Controls {
     pub fn update_levels(&self, status: &Status) {
         self.update_slider(&self.pb_raw_slider, &self.pb_raw_label, status.playback_in);
-        self.update_slider(&self.pb_filt_slider, &self.pb_filt_label, status.playback_out);
-        self.update_slider(&self.rec_raw_slider, &self.rec_raw_label, status.recording_in);
-        self.update_slider(&self.rec_filt_slider, &self.rec_filt_label, status.recording_out);
+        self.update_slider(
+            &self.pb_filt_slider,
+            &self.pb_filt_label,
+            status.playback_out,
+        );
+        self.update_slider(
+            &self.rec_raw_slider,
+            &self.rec_raw_label,
+            status.recording_in,
+        );
+        self.update_slider(
+            &self.rec_filt_slider,
+            &self.rec_filt_label,
+            status.recording_out,
+        );
     }
 
     fn update_slider(&self, slider: &NSSlider, label: &NSTextField, level: f32) {
@@ -289,53 +366,73 @@ impl Controls {
     }
 
     pub fn populate_devices(&self, sinks: &[DeviceInfo], sources: &[DeviceInfo]) {
-        let selected_sink = self.sink_popup.titleOfSelectedItem()
+        let selected_sink = self
+            .sink_popup
+            .titleOfSelectedItem()
             .map(|s| s.to_string())
             .unwrap_or_default();
 
         self.sink_popup.removeAllItems();
-        self.sink_popup.addItemWithTitle(&NSString::from_str("Default"));
+        self.sink_popup
+            .addItemWithTitle(&NSString::from_str("Default"));
         for dev in sinks {
             if dev.name.contains("BlackHole") {
                 continue;
             }
-            self.sink_popup.addItemWithTitle(&NSString::from_str(&dev.name));
+            self.sink_popup
+                .addItemWithTitle(&NSString::from_str(&dev.name));
         }
         if !selected_sink.is_empty() {
-            self.sink_popup.selectItemWithTitle(&NSString::from_str(&selected_sink));
+            self.sink_popup
+                .selectItemWithTitle(&NSString::from_str(&selected_sink));
         }
 
-        let selected_source = self.source_popup.titleOfSelectedItem()
+        let selected_source = self
+            .source_popup
+            .titleOfSelectedItem()
             .map(|s| s.to_string())
             .unwrap_or_default();
 
         self.source_popup.removeAllItems();
-        self.source_popup.addItemWithTitle(&NSString::from_str("Default"));
+        self.source_popup
+            .addItemWithTitle(&NSString::from_str("Default"));
         for dev in sources {
             if dev.name.contains("BlackHole") {
                 continue;
             }
-            self.source_popup.addItemWithTitle(&NSString::from_str(&dev.name));
+            self.source_popup
+                .addItemWithTitle(&NSString::from_str(&dev.name));
         }
         if !selected_source.is_empty() {
-            self.source_popup.selectItemWithTitle(&NSString::from_str(&selected_source));
+            self.source_popup
+                .selectItemWithTitle(&NSString::from_str(&selected_source));
         }
     }
 
     pub fn selected_sink(&self) -> String {
-        self.sink_popup.titleOfSelectedItem()
+        self.sink_popup
+            .titleOfSelectedItem()
             .map(|s| {
                 let name = s.to_string();
-                if name == "Default" { "@DEFAULT_SINK@".into() } else { name }
+                if name == "Default" {
+                    "@DEFAULT_SINK@".into()
+                } else {
+                    name
+                }
             })
             .unwrap_or_else(|| "@DEFAULT_SINK@".into())
     }
 
     pub fn selected_source(&self) -> String {
-        self.source_popup.titleOfSelectedItem()
+        self.source_popup
+            .titleOfSelectedItem()
             .map(|s| {
                 let name = s.to_string();
-                if name == "Default" { "@DEFAULT_SOURCE@".into() } else { name }
+                if name == "Default" {
+                    "@DEFAULT_SOURCE@".into()
+                } else {
+                    name
+                }
             })
             .unwrap_or_else(|| "@DEFAULT_SOURCE@".into())
     }
