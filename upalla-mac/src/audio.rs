@@ -338,7 +338,7 @@ pub fn run_audio_engine(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) {
 }
 
 fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> {
-    let model = Model::DeepFilterNet3Ll;
+    let model = Model::default();
     let bypass = AtomicBool::new(false);
     let host = cpal::default_host();
     let default_input = host
