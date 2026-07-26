@@ -9,4 +9,3 @@ pub fn tray_image() -> objc2::rc::Retained<objc2_app_kit::NSImage> {
     let data = NSData::from_vec(ICON_64_PNG.to_vec());
     NSImage::initWithData(NSImage::alloc(), &data).expect("failed to create NSImage from PNG")
 }
-

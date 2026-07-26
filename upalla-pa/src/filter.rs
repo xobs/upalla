@@ -12,6 +12,7 @@ use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
 use libpulse_binding as pulse;
 use libpulse_binding::def::{BufferAttr, Retval};
+use pulse::callbacks::ListResult;
 use pulse::context::{Context, FlagSet as CtxFlags};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::stream::{FlagSet as StreamFlags, PeekResult, Stream};
@@ -26,6 +27,8 @@ const REMAINDER_CAP: usize = 16384;
 /// Beyond this, the oldest frames are dropped to bound latency.
 const MAX_BUFFER_FRAMES: usize = 8;
 const FRAME_SIZE: usize = CHUNK * 2; // 960 f32 samples = 480 stereo samples = 10ms at 48kHz
+/// How often to check whether any app is listening on the virtual source.
+const LISTENER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Status {
     pub playback_in: f32,
@@ -304,6 +307,110 @@ where
         .collect()
 }
 
+/// Check whether any source output is connected to the named source
+/// using PulseAudio's introspection API.
+fn has_source_outputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
+    let src_idx = Rc::new(RefCell::new(0u32));
+    let idx_done = Rc::new(RefCell::new(false));
+    let _idx_op = context.introspect().get_source_info_by_name(name, {
+        let idx = src_idx.clone();
+        let done = idx_done.clone();
+        move |result| match result {
+            ListResult::Item(info) => *idx.borrow_mut() = info.index,
+            ListResult::End | ListResult::Error => *done.borrow_mut() = true,
+        }
+    });
+    while !*idx_done.borrow() {
+        if matches!(
+            mainloop.iterate(true),
+            IterateResult::Quit(_) | IterateResult::Err(_)
+        ) {
+            return false;
+        }
+    }
+    let src_idx = *src_idx.borrow();
+    if src_idx == 0 {
+        return false;
+    }
+
+    let has = Rc::new(RefCell::new(false));
+    let out_done = Rc::new(RefCell::new(false));
+    let _out_op = context.introspect().get_source_output_info_list({
+        let h = has.clone();
+        let d = out_done.clone();
+        move |result| match result {
+            ListResult::Item(info) => {
+                if info.source == src_idx {
+                    *h.borrow_mut() = true;
+                }
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        }
+    });
+    while !*out_done.borrow() {
+        if matches!(
+            mainloop.iterate(true),
+            IterateResult::Quit(_) | IterateResult::Err(_)
+        ) {
+            return false;
+        }
+    }
+    let active = *has.borrow();
+    active
+}
+
+/// Check whether any sink input (app) is connected to a named sink
+/// using PulseAudio's introspection API.
+fn has_sink_inputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
+    let sink_idx = Rc::new(RefCell::new(0u32));
+    let idx_done = Rc::new(RefCell::new(false));
+    let _idx_op = context.introspect().get_sink_info_by_name(name, {
+        let idx = sink_idx.clone();
+        let done = idx_done.clone();
+        move |result| match result {
+            ListResult::Item(info) => *idx.borrow_mut() = info.index,
+            ListResult::End | ListResult::Error => *done.borrow_mut() = true,
+        }
+    });
+    while !*idx_done.borrow() {
+        if matches!(
+            mainloop.iterate(true),
+            IterateResult::Quit(_) | IterateResult::Err(_)
+        ) {
+            return false;
+        }
+    }
+    let sink_idx = *sink_idx.borrow();
+    if sink_idx == 0 {
+        return false;
+    }
+
+    let has = Rc::new(RefCell::new(false));
+    let out_done = Rc::new(RefCell::new(false));
+    let _out_op = context.introspect().get_sink_input_info_list({
+        let h = has.clone();
+        let d = out_done.clone();
+        move |result| match result {
+            ListResult::Item(info) => {
+                if info.sink == sink_idx {
+                    *h.borrow_mut() = true;
+                }
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        }
+    });
+    while !*out_done.borrow() {
+        if matches!(
+            mainloop.iterate(true),
+            IterateResult::Quit(_) | IterateResult::Err(_)
+        ) {
+            return false;
+        }
+    }
+    let active = *has.borrow();
+    active
+}
+
 pub fn run_filter(
     model: Model,
     cmd_rx: Receiver<Cmd>,
@@ -403,11 +510,16 @@ pub fn run_filter(
         fragsize: u32::MAX,
     });
 
-    let mut sink_rec = Stream::new(&mut context, "sink-rec", &spec, None).context("sink rec")?;
-    sink_rec.connect_record(
-        Some(&format!("{}.monitor", SINK_NAME)),
-        record_attr.as_ref(),
-        recv_flags,
+    let mut sink_rec: Option<Stream> = None;
+    let mut capture_sink = false;
+    let mut sink_play = Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
+    let sink_play_dest = "@DEFAULT_SINK@".to_string();
+    sink_play.connect_playback(
+        Some(&sink_play_dest),
+        playback_attr.as_ref(),
+        play_flags,
+        None,
+        None,
     )?;
 
     let mut sink_play = Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
@@ -420,10 +532,10 @@ pub fn run_filter(
         None,
     )?;
 
-    let mut src_rec = Stream::new(&mut context, "src-rec", &spec, None).context("src rec")?;
+    let mut src_rec: Option<Stream> = None;
     let mut src_rec_source = "@DEFAULT_SOURCE@".to_string();
-    src_rec.connect_record(Some(&src_rec_source), record_attr.as_ref(), recv_flags)?;
-
+    let mut capture_src = false;
+    let mut listener_check = Instant::now();
     let mut src_play = Stream::new(&mut context, "src-play", &spec, None).context("src play")?;
     src_play.connect_playback(
         Some(SRC_SINK_NAME),
@@ -432,22 +544,92 @@ pub fn run_filter(
         None,
         None,
     )?;
-
     log::info!("Streams connected. Processing...");
-
     let mut denoiser_sink = Denoiser::new(&model, 2)?;
     let mut denoiser_src = Denoiser::new(&model.clone(), 2)?;
     let mut sink_in = AudioBuf::new();
     let mut sink_out = AudioBuf::new();
     let mut src_in = AudioBuf::new();
     let mut src_out = AudioBuf::new();
-
     let mut last_status = Instant::now();
     let mut rms_accum = [0.0f32; 8];
     let mut rms_count_sink = 0u32;
     let mut rms_count_src = 0u32;
 
     loop {
+        // Periodically check for active apps on our virtual sink and source
+        if listener_check.elapsed() >= LISTENER_CHECK_INTERVAL {
+            let has_sink = has_sink_inputs(&mut mainloop, &context, SINK_NAME);
+            let has_src = has_source_outputs(&mut mainloop, &context, SRC_VIRTUAL_NAME);
+
+            // Playback chain: capture from output null sink when apps route to it
+            if has_sink && !capture_sink {
+                let Some(mut new_rec) = Stream::new(&mut context, "sink-rec", &spec, None) else {
+                    log::error!("Failed to create sink-rec stream");
+                    listener_check = Instant::now();
+                    continue;
+                };
+                match new_rec.connect_record(
+                    Some(&format!("{}.monitor", SINK_NAME)),
+                    record_attr.as_ref(),
+                    recv_flags,
+                ) {
+                    Ok(()) => {
+                        sink_rec = Some(new_rec);
+                        sink_in.data.clear();
+                        sink_in.pos = 0;
+                        capture_sink = true;
+                        log::info!("Playback capture started (sink input on {SINK_NAME})");
+                    }
+                    Err(e) => log::error!("Failed to start playback capture: {e}"),
+                }
+            } else if !has_sink && capture_sink {
+                sink_in.data.clear();
+                sink_in.pos = 0;
+                sink_out.data.clear();
+                sink_out.pos = 0;
+                rms_count_sink = 0;
+                rms_accum[..4].fill(0.0);
+                sink_rec = None;
+                capture_sink = false;
+                log::info!("Playback capture stopped (no sink inputs on {SINK_NAME})");
+            }
+
+            // Recording chain: capture from mic when apps listen on virtual source
+            if has_src && !capture_src {
+                let Some(mut new_rec) = Stream::new(&mut context, "src-rec", &spec, None) else {
+                    log::error!("Failed to create src-rec stream");
+                    listener_check = Instant::now();
+                    continue;
+                };
+                match new_rec.connect_record(
+                    Some(&src_rec_source),
+                    record_attr.as_ref(),
+                    recv_flags,
+                ) {
+                    Ok(()) => {
+                        src_rec = Some(new_rec);
+                        src_in.data.clear();
+                        src_in.pos = 0;
+                        capture_src = true;
+                        log::info!("Mic capture started (listener on {SRC_VIRTUAL_NAME})");
+                    }
+                    Err(e) => log::error!("Failed to start mic capture: {e}"),
+                }
+            } else if !has_src && capture_src {
+                src_in.data.clear();
+                src_in.pos = 0;
+                src_out.data.clear();
+                src_out.pos = 0;
+                rms_count_src = 0;
+                rms_accum[4..8].fill(0.0);
+                src_rec = None;
+                capture_src = false;
+                log::info!("Mic capture stopped (no listeners on {SRC_VIRTUAL_NAME})");
+            }
+
+            listener_check = Instant::now();
+        }
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::SwitchModel(new_model) => {
@@ -475,21 +657,41 @@ pub fn run_filter(
                     )?;
                     sink_out.data.clear();
                     sink_out.pos = 0;
+                    let Some(mut new_rec) = Stream::new(&mut context, "sink-rec", &spec, None)
+                    else {
+                        log::error!("Failed to create sink-rec stream");
+                        break;
+                    };
+                    if let Err(e) = new_rec.connect_record(
+                        Some(&format!("{}.monitor", SINK_NAME)),
+                        record_attr.as_ref(),
+                        recv_flags,
+                    ) {
+                        log::error!("Failed to connect sink-rec: {e}");
+                    } else {
+                        sink_rec = Some(new_rec);
+                        capture_sink = true;
+                    }
                 }
                 Cmd::SetSource(name) => {
                     log::info!("Switching source input to {name}");
                     src_rec_source = name;
-                    drop(std::mem::replace(
-                        &mut src_rec,
-                        Stream::new(&mut context, "src-rec", &spec, None).context("src rec")?,
-                    ));
-                    src_rec.connect_record(
+                    let Some(mut new_rec) = Stream::new(&mut context, "src-rec", &spec, None)
+                    else {
+                        break;
+                    };
+                    if let Err(e) = new_rec.connect_record(
                         Some(&src_rec_source),
                         record_attr.as_ref(),
                         recv_flags,
-                    )?;
-                    src_in.data.clear();
-                    src_in.pos = 0;
+                    ) {
+                        log::error!("Failed to connect src-rec: {e}");
+                    } else {
+                        src_rec = Some(new_rec);
+                        src_in.data.clear();
+                        src_in.pos = 0;
+                        capture_src = true;
+                    }
                 }
                 Cmd::Shutdown => {
                     log::info!("PA filter received shutdown command");
@@ -498,8 +700,12 @@ pub fn run_filter(
             }
         }
 
-        pump_read(&mut sink_rec, &mut sink_in);
-        pump_read(&mut src_rec, &mut src_in);
+        if let Some(ref mut stream) = sink_rec {
+            pump_read(stream, &mut sink_in);
+        }
+        if let Some(ref mut stream) = src_rec {
+            pump_read(stream, &mut src_in);
+        }
 
         // Drop excess input to bound latency when processing falls behind
         sink_in.drop_excess();

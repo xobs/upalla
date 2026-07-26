@@ -142,10 +142,7 @@ pub fn enumerate_devices() -> Result<DeviceLists> {
         sources.len()
     );
 
-    Ok(DeviceLists {
-        sinks,
-        sources,
-    })
+    Ok(DeviceLists { sinks, sources })
 }
 
 fn device_matches(device: &cpal::Device, name: &str) -> bool {
