@@ -1,97 +1,97 @@
 # Upalla
 
-GPU-agnostic real-time noise suppression for Linux using **DeepFilterNet3**.
-
-Works with NVIDIA, AMD, Intel GPUs — or CPU only — via ONNX Runtime.
+GPU-agnostic real-time noise suppression using **DeepFilterNet3** via `tract` (pure Rust ONNX inference — no CUDA, no ROCm, no system GPU runtime needed).
 
 ## Quick Start
 
 ```bash
-# 1. Download the model
-./scripts/download-model.sh
-
-# 2. Build and run the native filter
-cargo build -p upalla-pw --release
-./target/release/upalla
+# PulseAudio / PipeWire filter (Linux)
+cargo build --release -p upalla-pa
+./target/release/upalla-pa
 ```
 
-A "Upalla Denoiser" audio source appears. Route your microphone through it using `pavucontrol`, `helvum`, or `qpwgraph`. Press Ctrl-C to stop.
+A "Upalla Denoised Output" sink and "Upalla Denoised Input" source appear. Route applications to the sink, or your microphone through the source, using `pavucontrol`, `helvum`, or `qpwgraph`. Press Ctrl-C to stop.
 
-No PipeWire config files, no LV2 plugin installation needed.
+## GUI Frontends
+
+```bash
+# Slint GUI (GTK style, system tray)
+cargo run --release -p upalla-slint
+
+# GTK4 GUI
+cargo run --release -p upalla-gtk
+```
+
+Both GUIs launch to the system tray. They auto-start the PulseAudio filter and show a window for level meters, device selection, and bypass toggles.
+
+## macOS
+
+```bash
+# Requires: zigbuild, macOS SDK
+SDKROOT=/path/to/MacOSX.sdk/ cargo zigbuild --target aarch64-apple-darwin --release -p upalla-mac
+```
+
+The macOS app uses CoreAudio directly (no PulseAudio dependency). It supports BlackHole for system-wide audio capture.
+
+## CLI WAV Denoiser
+
+```bash
+cargo run --release -p upalla-core -- input.wav output.wav
+```
 
 ## Architecture
 
 ```
-Microphone → PipeWire → upalla (native filter) → ONNX Runtime → Denoised Audio
-                              ↕                         ↕
-                         RT Audio Thread           Main Thread
-                         (process callback)    (synchronous ONNX CPU EP)
+                     ┌─────────────────────────────────┐
+                     │         upalla-pa / upalla-mac    │
+                     │  ┌──────────┐   ┌──────────────┐ │
+  mic/app audio ─────┼─▶│ pump_read │──▶│  process_one  │─┼──▶ denoised out
+                     │  └──────────┘   │  frame/iter   │ │
+                     │                 │  (if let, not  │ │
+                     │                 │   while let)   │ │
+                     │                 └──────┬───────┘ │
+                     │                        │         │
+                     │                 ┌──────▼───────┐ │
+                     │                 │  drop_excess  │ │
+                     │                 │  (bounds buf  │ │
+                     │                 │   at 8 frames)│ │
+                     │                 └──────────────┘ │
+                     └─────────────────────────────────┘
 ```
+
+Each crate uses a tight processing loop: `pump_read` → `drop_excess` (shed overload) → `process_one_frame` (at most one ONNX inference per iteration) → `pump_write`. This bounds latency at ~80-90ms under any system load.
+
+## Project Crates
+
+| Crate | Description | Platform |
+|---|---|---|
+| `upalla-core` | Denoiser engine + CLI WAV tool | All |
+| `upalla-pa` | PulseAudio realtime filter | Linux |
+| `upalla-slint` | Slint GUI (system tray) | Linux |
+| `upalla-gtk` | GTK4 GUI | Linux |
+| `upalla-mac` | Native macOS app (CoreAudio) | macOS |
+| `upalla-lv2` | LV2 plugin | Linux |
 
 ## Building
 
 ```bash
-# Prerequisites: Rust 1.92+, libonnxruntime.so (system or vendored)
+# All Linux targets
+cargo build --release -p upalla-core -p upalla-pa -p upalla-slint -p upalla-gtk
 
-# CLI WAV denoiser
-cargo build -p upalla-pw --release
-./target/release/upalla input.wav output.wav
-
-# LV2 plugin (requires PipeWire compiled with LV2 support)
-cargo build -p upalla-lv2 --release
-./scripts/install-lv2.sh
+# macOS (cross-compile)
+SDKROOT=/path/to/MacOSX.sdk/ cargo zigbuild --target aarch64-apple-darwin --release -p upalla-mac
 ```
 
-## Model Setup
+Requires Rust 1.80+ and PulseAudio development headers (`libpulse-dev` on Debian, `pulseaudio-libs-devel` on Fedora).
 
-```bash
-./scripts/download-model.sh
-```
-
-Downloads `enc.onnx`, `erb_dec.onnx`, `df_dec.onnx` to `~/.local/share/upalla/`.
-
-## GPU Setup
-
-Install ONNX Runtime for your GPU, or use the CPU fallback (bundled with most distros):
-
-| GPU | Package |
-|---|---|
-| AMD ROCm | `onnxruntime-rocm` |
-| NVIDIA CUDA | `onnxruntime-cuda` |
-| Intel OpenVINO | `onnxruntime-openvino` |
-| CPU fallback | `onnxruntime` (works without GPU) |
-
-If ONNX Runtime is installed to a non-standard path (e.g. `/usr/lib64/rocm/lib/`), set:
-
-```bash
-export ORT_DYLIB_PATH=/usr/lib64/rocm/lib/libonnxruntime.so.1.22.2
-```
-
-Upalla auto-searches common ROCm/CUDA paths. Set `ORT_DYLIB_PATH` if auto-detection fails.
-
-## Parameters (LV2 plugin only)
-
-| Parameter | Range | Default | Description |
-|---|---|---|---|
-| Suppression | 0-100% | 80% | Noise reduction strength |
-| VAD Threshold | 0-100% | 50% | Voice activity sensitivity |
-| Bypass | on/off | off | Pass audio through unprocessed |
-
-## GPU Backends
-
-ONNX Runtime auto-detects available providers at runtime:
-
-- **CUDA** (NVIDIA) — requires `libonnxruntime.so` with CUDA EP
-- **ROCm** (AMD) — requires `libonnxruntime.so` with ROCm EP
-- **OpenVINO** (Intel) — requires `libonnxruntime.so` with OpenVINO EP
-- **CPU** — always available fallback (RTF ~0.04 on Core i5)
+The DeepFilterNet3 model is compiled into each binary via `include_bytes!` — no separate download needed.
 
 ## Latency
 
-~40ms total:
-- STFT analysis: 10ms (1 frame)
-- Deep filter lookahead: 20ms (2 frames)
-- Worker thread buffer: 10ms (1 frame)
+~40ms total pipeline:
+- Frame size: 10ms (480 samples at 48 kHz)
+- Deep filter model: ~20ms lookahead
+- Buffer watermark: up to 80ms under load (oldest frames silently dropped when exceeded)
 
 ## License
 
