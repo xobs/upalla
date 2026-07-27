@@ -36,6 +36,8 @@ pub enum Cmd {
     SetSink(String),
     SetSource(String),
     SetBypass(bool),
+    #[allow(dead_code)]
+    SetMicCapture(bool),
     EnumerateDevices(Sender<DeviceLists>),
     Shutdown,
 }
@@ -361,12 +363,9 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
         log::info!("BlackHole not found — recording-only mode");
     }
 
-    let (pb_stream_in, mut pb_in_cons) = if let Some(ref bh) = bh_input {
-        let (s, c) = create_input(bh, &config, "pb")?;
-        (Some(s), Some(c))
-    } else {
-        (None, None)
-    };
+    let mut pb_stream_in: Option<cpal::Stream> = None;
+    let mut pb_in_cons: Option<ringbuf::HeapCons<f32>> = None;
+    let mut pb_capture_active = false;
     let (mut pb_stream_out, mut pb_out_prod) = {
         let (s, p) = create_output(&default_output, &config)?;
         (Some(s), Some(p))
@@ -379,8 +378,11 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut pb_rms_count = 0u32;
 
     let rec_output_dev = bh_output.as_ref().unwrap_or(&default_output);
-    let (mut rec_stream_in, mut rec_in_cons) = create_input(&default_input, &config, "rec")?;
+    // Start with mic capture disabled — only enable when user or listener detection requests it.
+    let mut rec_stream_in: Option<cpal::Stream> = None;
+    let mut rec_in_cons: Option<ringbuf::HeapCons<f32>> = None;
     let (rec_stream_out, mut rec_out_prod) = create_output(rec_output_dev, &config)?;
+    let mut capture_mic = false;
     let mut rec_audio_in = AudioBuf::new();
     let mut rec_audio_out = AudioBuf::new();
     let mut rec_denoiser = Denoiser::new(&model, 2)?;
@@ -388,16 +390,10 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut rec_rms_out = 0.0f32;
     let mut rec_rms_count = 0u32;
 
-    if let Some(ref s) = pb_stream_in {
-        s.play()?;
-        log::info!("Playback input stream started");
-    }
     if let Some(ref s) = pb_stream_out {
         s.play()?;
         log::info!("Playback output stream started");
     }
-    rec_stream_in.play()?;
-    log::info!("Recording input stream started");
     rec_stream_out.play()?;
     log::info!("Recording output stream started");
     log::info!("Input device: {}", device_name(&default_input));
@@ -444,22 +440,52 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 }
                 Cmd::SetSource(name) => {
                     log::info!("Switching recording input to {name}");
+                    // Drop old stream if any, then create and play the new one.
+                    rec_stream_in = None;
+                    rec_in_cons = None;
                     if let Some(dev) = find_input_by_name(&name) {
                         if let Ok((new_stream, new_cons)) = create_input(&dev, &config, "rec") {
-                            drop(std::mem::replace(&mut rec_stream_in, new_stream));
-                            if let Err(e) = rec_stream_in.play() {
+                            if let Err(e) = new_stream.play() {
                                 log::error!("Failed to start new input stream: {e}");
+                            } else {
+                                rec_stream_in = Some(new_stream);
+                                rec_in_cons = Some(new_cons);
+                                capture_mic = true;
                             }
-                            rec_in_cons = new_cons;
-                            rec_audio_in.data.clear();
-                            rec_audio_in.pos = 0;
                         }
-                    } else {
-                        log::warn!("Input device not found: {name}");
                     }
+                    rec_audio_in.data.clear();
+                    rec_audio_in.pos = 0;
                 }
                 Cmd::SetBypass(val) => {
                     bypass.store(val, Ordering::Relaxed);
+                }
+                Cmd::SetMicCapture(enable) => {
+                    if enable && !capture_mic {
+                        match create_input(&default_input, &config, "rec") {
+                            Ok((stream, cons)) => {
+                                if let Err(e) = stream.play() {
+                                    log::error!("Failed to start mic: {e}");
+                                } else {
+                                    rec_stream_in = Some(stream);
+                                    rec_in_cons = Some(cons);
+                                    capture_mic = true;
+                                    log::info!("Mic capture enabled (user)");
+                                }
+                            }
+                            Err(e) => log::error!("Failed to create mic stream: {e}"),
+                        }
+                    } else if !enable && capture_mic {
+                        rec_stream_in = None;
+                        rec_in_cons = None;
+                        capture_mic = false;
+                        rec_audio_in.data.clear();
+                        rec_audio_in.pos = 0;
+                        rec_audio_out.data.clear();
+                        rec_audio_out.pos = 0;
+                        rec_rms_count = 0;
+                        log::info!("Mic capture disabled (user)");
+                    }
                 }
                 Cmd::EnumerateDevices(tx) => {
                     if let Ok(devices) = enumerate_devices() {
@@ -479,7 +505,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
 
         let is_bypass = bypass.load(Ordering::Relaxed);
 
-        if has_playback {
+        if has_playback && pb_capture_active {
             if let Some(ref mut c) = pb_in_cons {
                 pump_input(c, &mut pb_audio_in, &mut temp_buf);
             }
@@ -498,21 +524,6 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 pump_output(p, &mut pb_audio_out);
             }
         }
-
-        pump_input(&mut rec_in_cons, &mut rec_audio_in, &mut temp_buf);
-        rec_audio_in.drop_excess();
-        process_chain(
-            &mut rec_audio_in,
-            &mut rec_audio_out,
-            &mut rec_denoiser,
-            is_bypass,
-            frame_size,
-            &mut rec_rms_in,
-            &mut rec_rms_out,
-            &mut rec_rms_count,
-        );
-        pump_output(&mut rec_out_prod, &mut rec_audio_out);
-
         if last_status.elapsed() >= Duration::from_millis(100) {
             let playback_in = if pb_rms_count > 0 {
                 pb_rms_in / pb_rms_count as f32
