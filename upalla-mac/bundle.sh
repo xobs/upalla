@@ -10,10 +10,23 @@ WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 APP_NAME="Upalla"
 BUNDLE_DIR="${WORKSPACE_DIR}/target/${APP_NAME}.app"
 TARGET="aarch64-apple-darwin"
-BINARY="${WORKSPACE_DIR}/target/${TARGET}/debug/upalla-mac"
 
-echo "=== Building ${TARGET} ==="
-(cd "${WORKSPACE_DIR}" && SDKROOT="${SDKROOT:-${HOME}/Code/MacOSX15.5.sdk}" cargo zigbuild --target "${TARGET}" -p upalla-mac)
+# Must be an optimised build: a debug build of the denoiser runs at roughly
+# RTF 1.9 (slower than real time), so the audio thread falls behind and
+# drop_excess() throws away frames — chopped-up speech and poor suppression.
+# Release measures around RTF 0.13. Set PROFILE=dev only for debugging.
+PROFILE="${PROFILE:-release}"
+if [ "${PROFILE}" = "dev" ]; then
+    PROFILE_DIR="debug"
+    CARGO_PROFILE_ARGS=()
+else
+    PROFILE_DIR="${PROFILE}"
+    CARGO_PROFILE_ARGS=(--profile "${PROFILE}")
+fi
+BINARY="${WORKSPACE_DIR}/target/${TARGET}/${PROFILE_DIR}/upalla-mac"
+
+echo "=== Building ${TARGET} (${PROFILE}) ==="
+(cd "${WORKSPACE_DIR}" && SDKROOT="${SDKROOT:-${HOME}/Code/MacOSX15.5.sdk}" cargo zigbuild --target "${TARGET}" "${CARGO_PROFILE_ARGS[@]}" -p upalla-mac)
 
 echo "=== Creating ${BUNDLE_DIR} ==="
 rm -rf "${BUNDLE_DIR}"

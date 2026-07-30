@@ -1,5 +1,5 @@
 use anyhow::Result;
-use df::tract::{DfTract, ReduceMask, RuntimeParams};
+use df::tract::{DfParams, DfTract, ReduceMask, RuntimeParams};
 use ndarray::Array2;
 
 use crate::model::Model;
@@ -13,17 +13,26 @@ pub struct StereoChunk {
 
 pub struct Denoiser {
     model: DfTract,
+    params: DfParams,
+    channels: usize,
+}
+
+fn runtime_params(channels: usize) -> RuntimeParams {
+    RuntimeParams::default_with_ch(channels)
+        .with_atten_lim(100.0)
+        .with_thresholds(-15.0, 35.0, 35.0)
+        .with_mask_reduce(ReduceMask::MAX)
 }
 
 impl Denoiser {
     pub fn new(model: &Model, channels: usize) -> Result<Self> {
         let params = model.to_params()?;
-        let rp = RuntimeParams::default_with_ch(channels)
-            .with_atten_lim(100.0)
-            .with_thresholds(-15.0, 35.0, 35.0)
-            .with_mask_reduce(ReduceMask::MAX);
-        let model = DfTract::new(params, &rp)?;
-        Ok(Denoiser { model })
+        let model = DfTract::new(params.clone(), &runtime_params(channels))?;
+        Ok(Denoiser {
+            model,
+            params,
+            channels,
+        })
     }
 
     pub fn process_stereo(&mut self, input: &StereoChunk) -> Result<StereoChunk> {
@@ -72,9 +81,20 @@ impl Denoiser {
         Ok(CHUNK)
     }
 
-    pub fn reset(&mut self) {
-        if let Err(e) = self.model.init() {
-            log::error!("Failed to reset model: {e}");
-        }
+    /// Drops all internal model state by rebuilding the network.
+    ///
+    /// Note that `DfTract::init()` cannot be used for this: it clears
+    /// `rolling_spec_buf_y` but *not* `rolling_spec_buf_x`, and `DfTract::new()`
+    /// has already called it once. Calling it again therefore grows the noisy
+    /// spectrum buffer, which permanently misaligns the deep-filter stage and the
+    /// upper-frequency mix — audible as a robotic, metallic voice.
+    ///
+    /// Rebuilding reloads and re-optimises the ONNX graph, so this takes on the
+    /// order of a second. It is not safe to call from a real-time audio path;
+    /// the rolling buffers flush themselves within `df_order` frames (~50 ms)
+    /// anyway, so a stream restart does not need an explicit reset.
+    pub fn reset(&mut self) -> Result<()> {
+        self.model = DfTract::new(self.params.clone(), &runtime_params(self.channels))?;
+        Ok(())
     }
 }

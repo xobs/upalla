@@ -17,6 +17,24 @@ const RINGBUF_CAP: usize = 16384;
 const MAX_BUFFER_FRAMES: usize = 8;
 const FRAME_SIZE: usize = CHUNK * 2; // 960 f32 = 480 stereo frames = 10ms at 48kHz
 
+/// Silence pushed into an output ring before its stream starts, as a jitter
+/// cushion.
+///
+/// Without it the ring sits near empty: the processing loop only produces output
+/// after input arrives, so any late loop iteration — this is an ordinary
+/// priority thread doing polling, not a real-time callback — leaves the output
+/// callback short and it zero-fills, which is audible as clipped speech. The
+/// input and output devices also run on independent clocks, so their drift eats
+/// into the same margin. Costs this much added latency; `drop_excess` still
+/// bounds the other end.
+const OUTPUT_PREFILL_FRAMES: usize = 3; // 30ms
+
+/// Occupancy below which the cushion is topped back up to
+/// [`OUTPUT_PREFILL_FRAMES`]. Two frames rather than one: waiting until a single
+/// frame is left means the output callback can starve within the same period,
+/// before the processing loop gets a chance to refill.
+const OUTPUT_LOW_WATER_FRAMES: usize = 2; // 20ms
+
 pub struct Status {
     pub playback_in: f32,
     pub playback_out: f32,
@@ -97,7 +115,19 @@ impl AudioBuf {
         if excess > 0 {
             let drop_samples = (excess / FRAME_SIZE) * FRAME_SIZE;
             if drop_samples > 0 {
-                log::debug!("Dropping {drop_samples} samples to bound latency");
+                // Dropping here means the denoiser is not keeping up with real
+                // time, which is audible as chopped speech — warn, but only once
+                // a second so a sustained overload cannot flood the log.
+                static LAST_WARN: AtomicU64 = AtomicU64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if LAST_WARN.swap(now, Ordering::Relaxed) != now {
+                    log::warn!(
+                        "Audio thread behind real time: dropping {drop_samples} samples to bound latency"
+                    );
+                }
                 self.pos += drop_samples;
                 if self.pos > REMAINDER_CAP {
                     self.data.drain(..self.pos);
@@ -178,11 +208,23 @@ fn find_blackhole_output() -> Option<cpal::Device> {
         .find(|d| device_name(d).contains("BlackHole"))
 }
 
-fn find_blackhole_input() -> Option<cpal::Device> {
-    cpal::default_host()
+/// Finds a BlackHole input, preferring one that is *not* `exclude`.
+///
+/// BlackHole is a loopback: anything written to it reappears on its input. If the
+/// playback chain read the same device the recording chain writes the denoised mic
+/// into, the user would hear themselves. With two BlackHole devices installed the
+/// chains can each have their own; with one they have to take turns.
+fn find_blackhole_input_excluding(exclude: Option<&str>) -> Option<cpal::Device> {
+    let candidates: Vec<cpal::Device> = cpal::default_host()
         .input_devices()
         .ok()?
-        .find(|d| device_name(d).contains("BlackHole"))
+        .filter(|d| device_name(d).contains("BlackHole"))
+        .collect();
+    candidates
+        .iter()
+        .find(|d| Some(device_name(d).as_str()) != exclude)
+        .or_else(|| candidates.first())
+        .cloned()
 }
 
 fn create_input(
@@ -193,20 +235,22 @@ fn create_input(
     let rb = HeapRb::<f32>::new(RINGBUF_CAP);
     let (mut prod, cons) = rb.split();
 
+    // Per-stream, so one stream's warnings cannot mask another's.
+    let mut last_warn = 0u64;
+
     let stream = device.build_input_stream(
         config.clone(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             let n = prod.push_slice(data);
             if n < data.len() {
-                static LAST_WARN: AtomicU64 = AtomicU64::new(0);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                let last = LAST_WARN.swap(now, Ordering::Relaxed);
-                if now != last {
+                if now != last_warn {
+                    last_warn = now;
                     log::warn!(
-                        "Input ring buffer overflow, dropped {} samples",
+                        "[{tag}] input ring buffer overflow, dropped {} samples",
                         data.len() - n
                     );
                 }
@@ -229,9 +273,16 @@ fn create_input(
 fn create_output(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
+    tag: &'static str,
 ) -> Result<(cpal::Stream, ringbuf::HeapProd<f32>)> {
     let rb = HeapRb::<f32>::new(RINGBUF_CAP);
     let (prod, mut cons) = rb.split();
+
+    // Per-stream, so a chronically starved stream cannot mask another's warnings.
+    let mut last_warn = 0u64;
+    // A stream that has never been fed is idle by design, not starved; only report
+    // shortfalls once real audio has started flowing through it.
+    let mut seen_data = false;
 
     let stream = device.build_output_stream(
         config.clone(),
@@ -239,6 +290,23 @@ fn create_output(
             let n = cons.pop_slice(data);
             for s in &mut data[n..] {
                 *s = 0.0;
+            }
+            seen_data |= n > 0;
+            if seen_data && n < data.len() {
+                // Zero-filling mid-stream is an underrun: the jitter cushion is
+                // gone and the gap is audible. Rate-limited to once a second.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if now != last_warn {
+                    last_warn = now;
+                    log::warn!(
+                        "[{tag}] output underrun: {} of {} samples missing",
+                        data.len() - n,
+                        data.len()
+                    );
+                }
             }
         },
         |err| log::error!("Output stream error: {err}"),
@@ -248,19 +316,47 @@ fn create_output(
     Ok((stream, prod))
 }
 
-type RecChain = (
+/// A started chain: input stream + its consumer, output stream + its producer.
+type Chain = (
     cpal::Stream,
     ringbuf::HeapCons<f32>,
     cpal::Stream,
     ringbuf::HeapProd<f32>,
 );
 
+/// Opens the BlackHole input and the speaker output and starts both.
+fn start_pb_chain(
+    bh_input: &cpal::Device,
+    sink: Option<&str>,
+    config: &cpal::StreamConfig,
+) -> Result<Chain> {
+    let output_dev = match sink {
+        Some(name) => {
+            find_output_by_name(name).with_context(|| format!("Output device not found: {name}"))?
+        }
+        None => cpal::default_host()
+            .default_output_device()
+            .context("No output device available")?,
+    };
+    let (stream_in, cons) = create_input(bh_input, config, "pb")?;
+    let (stream_out, mut prod) = create_output(&output_dev, config, "pb")?;
+    prod.push_slice(&vec![0.0f32; OUTPUT_PREFILL_FRAMES * FRAME_SIZE]);
+    stream_in.play()?;
+    stream_out.play()?;
+    log::info!(
+        "Playback chain started ({} -> {})",
+        device_name(bh_input),
+        device_name(&output_dev)
+    );
+    Ok((stream_in, cons, stream_out, prod))
+}
+
 /// Opens the mic input and the BlackHole output and starts both.
 fn start_rec_chain(
     source: Option<&str>,
     output_dev: &cpal::Device,
     config: &cpal::StreamConfig,
-) -> Result<RecChain> {
+) -> Result<Chain> {
     let input_dev = match source {
         Some(name) => {
             find_input_by_name(name).with_context(|| format!("Input device not found: {name}"))?
@@ -270,9 +366,14 @@ fn start_rec_chain(
             .context("No input device available")?,
     };
     let (stream_in, cons) = create_input(&input_dev, config, "rec")?;
-    let (stream_out, prod) = create_output(output_dev, config)?;
-    stream_out.play()?;
+    let (stream_out, mut prod) = create_output(output_dev, config, "rec")?;
+    let prefill = vec![0.0f32; OUTPUT_PREFILL_FRAMES * FRAME_SIZE];
+    prod.push_slice(&prefill);
+    // Input first: starting a device takes tens of milliseconds, and an output
+    // that is already draining would burn through the cushion before the first
+    // mic buffer ever lands.
     stream_in.play()?;
+    stream_out.play()?;
     log::info!(
         "Recording chain started (input: {})",
         device_name(&input_dev)
@@ -346,6 +447,24 @@ fn pump_input(cons: &mut ringbuf::HeapCons<f32>, audio_in: &mut AudioBuf, temp_b
 }
 
 fn pump_output(prod: &mut ringbuf::HeapProd<f32>, audio_out: &mut AudioBuf) {
+    // Rebuild the jitter cushion when it runs dry. A single late iteration, or
+    // slow drift between the input and output device clocks, otherwise leaves the
+    // ring permanently at zero margin, so every later hiccup punches another hole
+    // in the outgoing audio. Only tops up what we cannot cover with real audio
+    // that is already waiting.
+    let occupied = prod.occupied_len();
+    if occupied < OUTPUT_LOW_WATER_FRAMES * FRAME_SIZE {
+        let target = OUTPUT_PREFILL_FRAMES * FRAME_SIZE;
+        let deficit = target
+            .saturating_sub(occupied + audio_out.len())
+            .min(prod.vacant_len());
+        if deficit > 0 {
+            log::debug!("Output cushion dry, inserting {deficit} samples of silence");
+            let silence = vec![0.0f32; deficit];
+            prod.push_slice(&silence);
+        }
+    }
+
     let out_avail = audio_out.len();
     if out_avail == 0 {
         return;
@@ -388,7 +507,10 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     };
 
     let bh_output = find_blackhole_output();
-    let bh_input = find_blackhole_input();
+    // Prefer a different BlackHole device from the one the recording chain writes
+    // to, so the two chains do not loop through each other.
+    let rec_bh_name = bh_output.as_ref().map(device_name);
+    let bh_input = find_blackhole_input_excluding(rec_bh_name.as_deref());
     let has_playback = bh_input.is_some();
 
     if has_playback {
@@ -397,13 +519,30 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
         log::info!("BlackHole not found — recording-only mode");
     }
 
+    // Both chains share one BlackHole device when only one is installed. Because
+    // it is a loopback, running them together would feed the denoised mic straight
+    // back to the speakers, so in that case they are mutually exclusive and the
+    // recording chain wins.
+    let chains_share_device = match (&bh_input, &bh_output) {
+        (Some(i), Some(o)) => device_name(i) == device_name(o),
+        _ => false,
+    };
+    if chains_share_device {
+        log::info!(
+            "Only one BlackHole device ({}) — playback chain will yield to recording",
+            bh_input.as_ref().map(device_name).unwrap_or_default()
+        );
+    }
+
+    // Like the recording chain, the playback chain stays closed until needed:
+    // reading BlackHole's input is a capture stream, so holding it open would make
+    // macOS report Upalla as recording again.
     let mut pb_stream_in: Option<cpal::Stream> = None;
     let mut pb_in_cons: Option<ringbuf::HeapCons<f32>> = None;
+    let mut pb_stream_out: Option<cpal::Stream> = None;
+    let mut pb_out_prod: Option<ringbuf::HeapProd<f32>> = None;
+    let mut pb_sink: Option<String> = None;
     let mut pb_capture_active = false;
-    let (mut pb_stream_out, mut pb_out_prod) = {
-        let (s, p) = create_output(&default_output, &config)?;
-        (Some(s), Some(p))
-    };
     let mut pb_audio_in = AudioBuf::new();
     let mut pb_audio_out = AudioBuf::new();
     let mut pb_denoiser = Denoiser::new(&model, 2)?;
@@ -422,15 +561,26 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut rec_source: Option<String> = None;
     let mut capture_mic = false;
 
-    // Listener detection: only capture while another process reads from BlackHole.
-    let bh_device_id = blackhole::find_device();
-    let auto_capture = bh_device_id.is_some() && blackhole::detection_supported();
-    match (bh_device_id, auto_capture) {
+    // Demand detection: each chain runs only while another process is using its
+    // side of BlackHole — capturing from it (wants our denoised mic) or playing to
+    // it (wants its audio denoised).
+    let detection = blackhole::detection_supported();
+    let rec_bh_id = rec_bh_name
+        .as_deref()
+        .and_then(blackhole::find_device_by_name);
+    let pb_bh_id = bh_input
+        .as_ref()
+        .map(device_name)
+        .as_deref()
+        .and_then(blackhole::find_device_by_name);
+    let auto_capture = rec_bh_id.is_some() && detection;
+    let auto_playback = pb_bh_id.is_some() && detection;
+    match (rec_bh_id.or(pb_bh_id), detection) {
         (Some(_), true) => {
-            log::info!("BlackHole listener detection active — mic opens on demand")
+            log::info!("BlackHole demand detection active — chains open on demand")
         }
         (Some(_), false) => log::info!(
-            "BlackHole listener detection unavailable (needs macOS 14.4+) — mic is manual"
+            "BlackHole demand detection unavailable (needs macOS 14.4+) — mic is manual, playback chain off"
         ),
         (None, _) => log::info!("BlackHole device not found — mic is manual"),
     }
@@ -442,10 +592,6 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut rec_rms_out = 0.0f32;
     let mut rec_rms_count = 0u32;
 
-    if let Some(ref s) = pb_stream_out {
-        s.play()?;
-        log::info!("Playback output stream started");
-    }
     log::info!("Input device: {}", device_name(&default_input));
     log::info!("Output device: {}", device_name(&default_output));
     if let Some(ref bh) = bh_input {
@@ -470,23 +616,32 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
             match cmd {
                 Cmd::SetSink(name) => {
                     log::info!("Switching playback output to {name}");
-                    if let Some(dev) = find_output_by_name(&name) {
-                        if let Ok((new_stream, new_prod)) = create_output(&dev, &config) {
-                            if let Some(old) = pb_stream_out.replace(new_stream) {
-                                drop(old);
-                            }
-                            if let Some(ref s) = pb_stream_out {
-                                if let Err(e) = s.play() {
-                                    log::error!("Failed to start new output stream: {e}");
+                    pb_sink = Some(name);
+                    // Restart only if the chain is running; otherwise the new sink
+                    // is picked up the next time the chain opens.
+                    if pb_capture_active {
+                        pb_stream_in = None;
+                        pb_in_cons = None;
+                        pb_stream_out = None;
+                        pb_out_prod = None;
+                        pb_capture_active = false;
+                        if let Some(ref bh) = bh_input {
+                            match start_pb_chain(bh, pb_sink.as_deref(), &config) {
+                                Ok((si, ci, so, po)) => {
+                                    pb_stream_in = Some(si);
+                                    pb_in_cons = Some(ci);
+                                    pb_stream_out = Some(so);
+                                    pb_out_prod = Some(po);
+                                    pb_capture_active = true;
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to restart playback chain: {e}")
                                 }
                             }
-                            pb_out_prod = Some(new_prod);
-                            pb_audio_out.data.clear();
-                            pb_audio_out.pos = 0;
                         }
-                    } else {
-                        log::warn!("Output device not found: {name}");
                     }
+                    pb_audio_out.data.clear();
+                    pb_audio_out.pos = 0;
                 }
                 Cmd::SetSource(name) => {
                     log::info!("Switching recording input to {name}");
@@ -561,12 +716,20 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
 
         let is_bypass = bypass.load(Ordering::Relaxed);
 
-        // Start/stop the recording chain based on whether anything else is
-        // capturing from BlackHole, so macOS only flags us as recording in use.
-        if auto_capture && last_listener_poll.elapsed() >= Duration::from_millis(500) {
+        // Start/stop each chain based on whether anything else is using its side of
+        // BlackHole, so macOS only flags us as recording while we are in use.
+        let poll_due = (auto_capture || auto_playback)
+            && last_listener_poll.elapsed() >= Duration::from_millis(500);
+        if poll_due {
             last_listener_poll = Instant::now();
-            let device = bh_device_id.expect("auto_capture implies a BlackHole device");
-            match blackhole::has_external_listener(device) {
+        }
+
+        if poll_due && auto_capture {
+            let device = rec_bh_id.expect("auto_capture implies a BlackHole device");
+            match blackhole::has_external_user(device, blackhole::Direction::Capture) {
+                // The denoiser is deliberately not reset here: its rolling
+                // spectrum buffers flush within df_order frames (~50ms) on their
+                // own, and rebuilding the model would stall this thread.
                 Some(true) if !capture_mic => {
                     match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
                         Ok((si, ci, so, po)) => {
@@ -574,7 +737,6 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                             rec_in_cons = Some(ci);
                             rec_stream_out = Some(so);
                             rec_out_prod = Some(po);
-                            rec_denoiser.reset();
                             capture_mic = true;
                             log::info!("BlackHole listener detected — recording chain started");
                         }
@@ -593,6 +755,53 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                     rec_audio_out.pos = 0;
                     rec_rms_count = 0;
                     log::info!("No BlackHole listener left — recording chain stopped");
+                }
+                _ => {}
+            }
+        }
+
+        if poll_due && auto_playback {
+            let device = pb_bh_id.expect("auto_playback implies a BlackHole device");
+            // With a single BlackHole device the recording chain owns it; running
+            // both would loop our own denoised mic back to the speakers.
+            let yielded = chains_share_device && capture_mic;
+            let wants = if yielded {
+                Some(false)
+            } else {
+                blackhole::has_external_user(device, blackhole::Direction::Playback)
+            };
+            match wants {
+                Some(true) if !pb_capture_active => {
+                    if let Some(ref bh) = bh_input {
+                        match start_pb_chain(bh, pb_sink.as_deref(), &config) {
+                            Ok((si, ci, so, po)) => {
+                                pb_stream_in = Some(si);
+                                pb_in_cons = Some(ci);
+                                pb_stream_out = Some(so);
+                                pb_out_prod = Some(po);
+                                pb_capture_active = true;
+                                log::info!("BlackHole playback detected — playback chain started");
+                            }
+                            Err(e) => log::error!("Failed to start playback chain: {e}"),
+                        }
+                    }
+                }
+                Some(false) if pb_capture_active => {
+                    pb_stream_in = None;
+                    pb_in_cons = None;
+                    pb_stream_out = None;
+                    pb_out_prod = None;
+                    pb_capture_active = false;
+                    pb_audio_in.data.clear();
+                    pb_audio_in.pos = 0;
+                    pb_audio_out.data.clear();
+                    pb_audio_out.pos = 0;
+                    pb_rms_count = 0;
+                    if yielded {
+                        log::info!("Playback chain stopped — yielding BlackHole to recording");
+                    } else {
+                        log::info!("Nothing playing to BlackHole — playback chain stopped");
+                    }
                 }
                 _ => {}
             }

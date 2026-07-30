@@ -27,7 +27,9 @@ const PROP_NAME: u32 = fourcc(b"lnam"); // kAudioObjectPropertyName
 const PROP_PROCESS_LIST: u32 = fourcc(b"prs#"); // kAudioHardwarePropertyProcessObjectList
 const PROP_PROCESS_PID: u32 = fourcc(b"ppid"); // kAudioProcessPropertyPID
 const PROP_PROCESS_RUNNING_INPUT: u32 = fourcc(b"piri"); // kAudioProcessPropertyIsRunningInput
+const PROP_PROCESS_RUNNING_OUTPUT: u32 = fourcc(b"piro"); // kAudioProcessPropertyIsRunningOutput
 const PROP_PROCESS_DEVICES: u32 = fourcc(b"pdv#"); // kAudioProcessPropertyDevices
+const SCOPE_OUTPUT: u32 = fourcc(b"outp"); // kAudioObjectPropertyScopeOutput
 
 const fn fourcc(code: &[u8; 4]) -> u32 {
     u32::from_be_bytes(*code)
@@ -142,27 +144,53 @@ fn get_name(object: AudioObjectID) -> Option<String> {
     Some(name.to_string())
 }
 
-/// The `AudioObjectID` of the BlackHole device, if it is installed.
-pub fn find_device() -> Option<AudioObjectID> {
+/// The `AudioObjectID` of the device with this exact name.
+///
+/// Matched by name rather than "first BlackHole" so that a setup with several
+/// BlackHole devices resolves each one to the right object.
+pub fn find_device_by_name(name: &str) -> Option<AudioObjectID> {
     let address = AudioObjectPropertyAddress::new(PROP_DEVICES, SCOPE_GLOBAL);
     let devices = get_object_list(SYSTEM_OBJECT, &address)?;
-    devices.into_iter().find(|&id| {
-        get_name(id)
-            .map(|n| n.contains("BlackHole"))
-            .unwrap_or(false)
-    })
+    devices
+        .into_iter()
+        .find(|&id| get_name(id).as_deref() == Some(name))
 }
 
-/// Whether the process-object API used by [`has_external_listener`] is available
-/// (macOS 14.4+). When it is not, capture has to be driven manually.
+/// Whether the process-object API used by [`has_external_user`] is available
+/// (macOS 14.4+). When it is not, the chains have to be driven manually.
 pub fn detection_supported() -> bool {
     let address = AudioObjectPropertyAddress::new(PROP_PROCESS_LIST, SCOPE_GLOBAL);
     get_object_list(SYSTEM_OBJECT, &address).is_some()
 }
 
-/// `Some(true)` if a process other than this one is capturing from `device`,
-/// `None` if that cannot be determined on this system.
-pub fn has_external_listener(device: AudioObjectID) -> Option<bool> {
+/// Which side of a device another process is using.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    /// Reading from the device — for BlackHole, an app using it as a microphone.
+    Capture,
+    /// Writing to the device — for BlackHole, an app using it as a speaker.
+    Playback,
+}
+
+impl Direction {
+    fn running_selector(self) -> u32 {
+        match self {
+            Direction::Capture => PROP_PROCESS_RUNNING_INPUT,
+            Direction::Playback => PROP_PROCESS_RUNNING_OUTPUT,
+        }
+    }
+
+    fn scope(self) -> u32 {
+        match self {
+            Direction::Capture => SCOPE_INPUT,
+            Direction::Playback => SCOPE_OUTPUT,
+        }
+    }
+}
+
+/// `Some(true)` if a process other than this one is using `device` in
+/// `direction`, `None` if that cannot be determined on this system.
+pub fn has_external_user(device: AudioObjectID, direction: Direction) -> Option<bool> {
     let address = AudioObjectPropertyAddress::new(PROP_PROCESS_LIST, SCOPE_GLOBAL);
     let processes = get_object_list(SYSTEM_OBJECT, &address)?;
     let own_pid = std::process::id();
@@ -173,11 +201,12 @@ pub fn has_external_listener(device: AudioObjectID) -> Option<bool> {
             continue;
         }
         let running_address =
-            AudioObjectPropertyAddress::new(PROP_PROCESS_RUNNING_INPUT, SCOPE_GLOBAL);
+            AudioObjectPropertyAddress::new(direction.running_selector(), SCOPE_GLOBAL);
         if get_u32(process, &running_address).unwrap_or(0) == 0 {
             continue;
         }
-        let devices_address = AudioObjectPropertyAddress::new(PROP_PROCESS_DEVICES, SCOPE_INPUT);
+        let devices_address =
+            AudioObjectPropertyAddress::new(PROP_PROCESS_DEVICES, direction.scope());
         if let Some(devices) = get_object_list(process, &devices_address) {
             if devices.contains(&device) {
                 return Some(true);
