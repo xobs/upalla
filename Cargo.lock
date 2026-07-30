@@ -1282,6 +1282,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "deep_filter"
 version = "0.5.7-pre"
+source = "git+https://github.com/xobs/DeepFilterNet.git?branch=tract-0.23#bb42a3e0929dd1386b595a22ce87b122ad73a40c"
 dependencies = [
  "anyhow",
  "claxon",
