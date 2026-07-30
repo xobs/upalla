@@ -6,6 +6,8 @@ use crossbeam_channel::{Receiver, Sender};
 use upalla_core::denoiser::{Denoiser, StereoChunk, CHUNK};
 use upalla_core::model::Model;
 
+use crate::blackhole;
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::traits::{Consumer as _, Observer, Producer as _, Split};
 use ringbuf::HeapRb;
@@ -246,6 +248,38 @@ fn create_output(
     Ok((stream, prod))
 }
 
+type RecChain = (
+    cpal::Stream,
+    ringbuf::HeapCons<f32>,
+    cpal::Stream,
+    ringbuf::HeapProd<f32>,
+);
+
+/// Opens the mic input and the BlackHole output and starts both.
+fn start_rec_chain(
+    source: Option<&str>,
+    output_dev: &cpal::Device,
+    config: &cpal::StreamConfig,
+) -> Result<RecChain> {
+    let input_dev = match source {
+        Some(name) => {
+            find_input_by_name(name).with_context(|| format!("Input device not found: {name}"))?
+        }
+        None => cpal::default_host()
+            .default_input_device()
+            .context("No input device available")?,
+    };
+    let (stream_in, cons) = create_input(&input_dev, config, "rec")?;
+    let (stream_out, prod) = create_output(output_dev, config)?;
+    stream_out.play()?;
+    stream_in.play()?;
+    log::info!(
+        "Recording chain started (input: {})",
+        device_name(&input_dev)
+    );
+    Ok((stream_in, cons, stream_out, prod))
+}
+
 fn process_chain(
     audio_in: &mut AudioBuf,
     audio_out: &mut AudioBuf,
@@ -377,12 +411,30 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut pb_rms_out = 0.0f32;
     let mut pb_rms_count = 0u32;
 
-    let rec_output_dev = bh_output.as_ref().unwrap_or(&default_output);
-    // Start with mic capture disabled — only enable when user or listener detection requests it.
+    let rec_output_dev = bh_output.as_ref().unwrap_or(&default_output).clone();
+    // Start with the recording chain stopped. Neither the mic input nor the
+    // BlackHole output is opened until something else is listening on BlackHole —
+    // holding either open makes macOS report Upalla as recording.
     let mut rec_stream_in: Option<cpal::Stream> = None;
     let mut rec_in_cons: Option<ringbuf::HeapCons<f32>> = None;
-    let (rec_stream_out, mut rec_out_prod) = create_output(rec_output_dev, &config)?;
+    let mut rec_stream_out: Option<cpal::Stream> = None;
+    let mut rec_out_prod: Option<ringbuf::HeapProd<f32>> = None;
+    let mut rec_source: Option<String> = None;
     let mut capture_mic = false;
+
+    // Listener detection: only capture while another process reads from BlackHole.
+    let bh_device_id = blackhole::find_device();
+    let auto_capture = bh_device_id.is_some() && blackhole::detection_supported();
+    match (bh_device_id, auto_capture) {
+        (Some(_), true) => {
+            log::info!("BlackHole listener detection active — mic opens on demand")
+        }
+        (Some(_), false) => log::info!(
+            "BlackHole listener detection unavailable (needs macOS 14.4+) — mic is manual"
+        ),
+        (None, _) => log::info!("BlackHole device not found — mic is manual"),
+    }
+    let mut last_listener_poll = Instant::now() - Duration::from_secs(1);
     let mut rec_audio_in = AudioBuf::new();
     let mut rec_audio_out = AudioBuf::new();
     let mut rec_denoiser = Denoiser::new(&model, 2)?;
@@ -394,8 +446,6 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
         s.play()?;
         log::info!("Playback output stream started");
     }
-    rec_stream_out.play()?;
-    log::info!("Recording output stream started");
     log::info!("Input device: {}", device_name(&default_input));
     log::info!("Output device: {}", device_name(&default_output));
     if let Some(ref bh) = bh_input {
@@ -440,18 +490,24 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 }
                 Cmd::SetSource(name) => {
                     log::info!("Switching recording input to {name}");
-                    // Drop old stream if any, then create and play the new one.
-                    rec_stream_in = None;
-                    rec_in_cons = None;
-                    if let Some(dev) = find_input_by_name(&name) {
-                        if let Ok((new_stream, new_cons)) = create_input(&dev, &config, "rec") {
-                            if let Err(e) = new_stream.play() {
-                                log::error!("Failed to start new input stream: {e}");
-                            } else {
-                                rec_stream_in = Some(new_stream);
-                                rec_in_cons = Some(new_cons);
+                    rec_source = Some(name);
+                    // Restart the chain only if it is currently running; otherwise
+                    // the new source is picked up the next time a listener appears.
+                    if capture_mic {
+                        rec_stream_in = None;
+                        rec_in_cons = None;
+                        rec_stream_out = None;
+                        rec_out_prod = None;
+                        capture_mic = false;
+                        match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+                            Ok((si, ci, so, po)) => {
+                                rec_stream_in = Some(si);
+                                rec_in_cons = Some(ci);
+                                rec_stream_out = Some(so);
+                                rec_out_prod = Some(po);
                                 capture_mic = true;
                             }
+                            Err(e) => log::error!("Failed to restart recording chain: {e}"),
                         }
                     }
                     rec_audio_in.data.clear();
@@ -462,22 +518,22 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 }
                 Cmd::SetMicCapture(enable) => {
                     if enable && !capture_mic {
-                        match create_input(&default_input, &config, "rec") {
-                            Ok((stream, cons)) => {
-                                if let Err(e) = stream.play() {
-                                    log::error!("Failed to start mic: {e}");
-                                } else {
-                                    rec_stream_in = Some(stream);
-                                    rec_in_cons = Some(cons);
-                                    capture_mic = true;
-                                    log::info!("Mic capture enabled (user)");
-                                }
+                        match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+                            Ok((si, ci, so, po)) => {
+                                rec_stream_in = Some(si);
+                                rec_in_cons = Some(ci);
+                                rec_stream_out = Some(so);
+                                rec_out_prod = Some(po);
+                                capture_mic = true;
+                                log::info!("Mic capture enabled (user)");
                             }
-                            Err(e) => log::error!("Failed to create mic stream: {e}"),
+                            Err(e) => log::error!("Failed to start recording chain: {e}"),
                         }
                     } else if !enable && capture_mic {
                         rec_stream_in = None;
                         rec_in_cons = None;
+                        rec_stream_out = None;
+                        rec_out_prod = None;
                         capture_mic = false;
                         rec_audio_in.data.clear();
                         rec_audio_in.pos = 0;
@@ -504,6 +560,63 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
         }
 
         let is_bypass = bypass.load(Ordering::Relaxed);
+
+        // Start/stop the recording chain based on whether anything else is
+        // capturing from BlackHole, so macOS only flags us as recording in use.
+        if auto_capture && last_listener_poll.elapsed() >= Duration::from_millis(500) {
+            last_listener_poll = Instant::now();
+            let device = bh_device_id.expect("auto_capture implies a BlackHole device");
+            match blackhole::has_external_listener(device) {
+                Some(true) if !capture_mic => {
+                    match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+                        Ok((si, ci, so, po)) => {
+                            rec_stream_in = Some(si);
+                            rec_in_cons = Some(ci);
+                            rec_stream_out = Some(so);
+                            rec_out_prod = Some(po);
+                            rec_denoiser.reset();
+                            capture_mic = true;
+                            log::info!("BlackHole listener detected — recording chain started");
+                        }
+                        Err(e) => log::error!("Failed to start recording chain: {e}"),
+                    }
+                }
+                Some(false) if capture_mic => {
+                    rec_stream_in = None;
+                    rec_in_cons = None;
+                    rec_stream_out = None;
+                    rec_out_prod = None;
+                    capture_mic = false;
+                    rec_audio_in.data.clear();
+                    rec_audio_in.pos = 0;
+                    rec_audio_out.data.clear();
+                    rec_audio_out.pos = 0;
+                    rec_rms_count = 0;
+                    log::info!("No BlackHole listener left — recording chain stopped");
+                }
+                _ => {}
+            }
+        }
+
+        if capture_mic {
+            if let Some(ref mut c) = rec_in_cons {
+                pump_input(c, &mut rec_audio_in, &mut temp_buf);
+            }
+            rec_audio_in.drop_excess();
+            process_chain(
+                &mut rec_audio_in,
+                &mut rec_audio_out,
+                &mut rec_denoiser,
+                is_bypass,
+                frame_size,
+                &mut rec_rms_in,
+                &mut rec_rms_out,
+                &mut rec_rms_count,
+            );
+            if let Some(ref mut p) = rec_out_prod {
+                pump_output(p, &mut rec_audio_out);
+            }
+        }
 
         if has_playback && pb_capture_active {
             if let Some(ref mut c) = pb_in_cons {
@@ -571,7 +684,8 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
         }
 
         let pb_idle = !has_playback || (pb_audio_in.len() < frame_size && pb_audio_out.len() == 0);
-        let rec_idle = rec_audio_in.len() < frame_size && rec_audio_out.len() == 0;
+        let rec_idle =
+            !capture_mic || (rec_audio_in.len() < frame_size && rec_audio_out.len() == 0);
         if pb_idle && rec_idle {
             std::thread::sleep(Duration::from_micros(500));
         }

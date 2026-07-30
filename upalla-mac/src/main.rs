@@ -15,6 +15,7 @@ use objc2_foundation::{
 };
 
 mod audio;
+mod blackhole;
 mod controls;
 mod icon;
 mod tray;

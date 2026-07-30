@@ -95,6 +95,7 @@ The DeepFilterNet3 model is compiled into each binary via `include_bytes!` — n
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0, except for the macOS app (`upalla-mac/`), which is
+GPL-3.0-or-later — see [upalla-mac/LICENSE](upalla-mac/LICENSE).
 
 The DeepFilterNet3 model weights are used under their original Apache-2.0/MIT license.

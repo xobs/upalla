@@ -359,10 +359,7 @@ fn main() -> Result<()> {
     log::info!("Starting Upalla GTK4...");
 
     let enabled = Arc::new(AtomicBool::new(true));
-    let pa = Arc::new(PaFilter::new(
-        Model::DeepFilterNet3Ll,
-        Arc::clone(&enabled),
-    )?);
+    let pa = Arc::new(PaFilter::new(Model::default(), Arc::clone(&enabled))?);
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();
 

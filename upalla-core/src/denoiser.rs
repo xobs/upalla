@@ -1,5 +1,5 @@
 use anyhow::Result;
-use df::tract::{DfParams, DfTract, ReduceMask, RuntimeParams};
+use df::tract::{DfTract, ReduceMask, RuntimeParams};
 use ndarray::Array2;
 
 use crate::model::Model;
@@ -17,8 +17,7 @@ pub struct Denoiser {
 
 impl Denoiser {
     pub fn new(model: &Model, channels: usize) -> Result<Self> {
-        let bytes = model.to_bytes()?;
-        let params = DfParams::from_bytes(&bytes)?;
+        let params = model.to_params()?;
         let rp = RuntimeParams::default_with_ch(channels)
             .with_atten_lim(100.0)
             .with_thresholds(-15.0, 35.0, 35.0)
