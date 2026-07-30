@@ -116,6 +116,46 @@ impl AudioBuf {
 
 // ---- Helpers ----
 
+/// Input and output levels accumulated over one status interval, driving a
+/// chain's pair of VU meters.
+#[derive(Default)]
+struct RmsMeter {
+    input: f32,
+    output: f32,
+    count: u32,
+}
+
+impl RmsMeter {
+    /// Records the input and output level of one processed frame. Both figures
+    /// are per-frame sums across the two channels, so the count advances by two
+    /// and the means come out per channel.
+    fn push(&mut self, input: f32, output: f32) {
+        self.input += input;
+        self.output += output;
+        self.count += 2;
+    }
+
+    fn mean_input(&self) -> f32 {
+        self.mean(self.input)
+    }
+
+    fn mean_output(&self) -> f32 {
+        self.mean(self.output)
+    }
+
+    fn mean(&self, total: f32) -> f32 {
+        if self.count > 0 {
+            total / self.count as f32
+        } else {
+            0.0
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 fn compute_rms(chunk: &[f32]) -> f32 {
     let sum: f32 = chunk.iter().map(|&s| s * s).sum();
     (sum / chunk.len() as f32).sqrt()
@@ -133,12 +173,12 @@ fn enumerate_devices() -> Result<DeviceLists> {
     let default_sink = host
         .default_output_device()
         .as_ref()
-        .map(|d| device_name(d))
+        .map(device_name)
         .unwrap_or_default();
     let default_source = host
         .default_input_device()
         .as_ref()
-        .map(|d| device_name(d))
+        .map(device_name)
         .unwrap_or_default();
 
     let sinks: Vec<DeviceInfo> = host
@@ -225,7 +265,7 @@ fn create_input(
     let (mut prod, cons) = rb.split();
 
     let stream = device.build_input_stream(
-        config.clone(),
+        *config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             let n = prod.push_slice(data);
             if n < data.len() {
@@ -250,7 +290,7 @@ fn create_output(
     let (prod, mut cons) = rb.split();
 
     let stream = device.build_output_stream(
-        config.clone(),
+        *config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let n = cons.pop_slice(data);
             for s in &mut data[n..] {
@@ -272,9 +312,7 @@ fn process_chain(
     denoiser: &mut Denoiser,
     is_bypass: bool,
     frame_size: usize,
-    rms_in_accum: &mut f32,
-    rms_out_accum: &mut f32,
-    rms_count: &mut u32,
+    meter: &mut RmsMeter,
 ) {
     if let Some(frame) = audio_in.drain_frames(frame_size) {
         let mut sc = StereoChunk {
@@ -291,9 +329,7 @@ fn process_chain(
                 audio_out.data.push(sc.right[i]);
             }
             let r = compute_rms(&sc.left) + compute_rms(&sc.right);
-            *rms_in_accum += r;
-            *rms_out_accum += r;
-            *rms_count += 2;
+            meter.push(r, r);
         } else {
             match denoiser.process_stereo(&sc) {
                 Ok(out) => {
@@ -301,9 +337,10 @@ fn process_chain(
                         audio_out.data.push(out.left[i]);
                         audio_out.data.push(out.right[i]);
                     }
-                    *rms_in_accum += compute_rms(&sc.left) + compute_rms(&sc.right);
-                    *rms_out_accum += compute_rms(&out.left) + compute_rms(&out.right);
-                    *rms_count += 2;
+                    meter.push(
+                        compute_rms(&sc.left) + compute_rms(&sc.right),
+                        compute_rms(&out.left) + compute_rms(&out.right),
+                    );
                 }
                 Err(e) => {
                     log::error!("Denoiser error: {e}, falling back to bypass");
@@ -312,9 +349,7 @@ fn process_chain(
                         audio_out.data.push(sc.right[i]);
                     }
                     let r = compute_rms(&sc.left) + compute_rms(&sc.right);
-                    *rms_in_accum += r;
-                    *rms_out_accum += r;
-                    *rms_count += 2;
+                    meter.push(r, r);
                 }
             }
         }
@@ -397,9 +432,7 @@ pub fn run_filter(
     let mut pb_audio_in = AudioBuf::new();
     let mut pb_audio_out = AudioBuf::new();
     let mut pb_denoiser = Denoiser::new(&model, 2)?;
-    let mut pb_rms_in = 0.0f32;
-    let mut pb_rms_out = 0.0f32;
-    let mut pb_rms_count = 0u32;
+    let mut pb_meter = RmsMeter::default();
 
     // ---- Recording chain (mic → BlackHole / speakers) ----
     let rec_output_dev = bh_output.as_ref().unwrap_or(&default_output);
@@ -408,9 +441,7 @@ pub fn run_filter(
     let mut rec_audio_in = AudioBuf::new();
     let mut rec_audio_out = AudioBuf::new();
     let mut rec_denoiser = Denoiser::new(&model, 2)?;
-    let mut rec_rms_in = 0.0f32;
-    let mut rec_rms_out = 0.0f32;
-    let mut rec_rms_count = 0u32;
+    let mut rec_meter = RmsMeter::default();
 
     // ---- Start streams after model init ----
     if let Some(ref s) = pb_stream_in {
@@ -499,9 +530,7 @@ pub fn run_filter(
                 &mut pb_denoiser,
                 pb_bypass,
                 frame_size,
-                &mut pb_rms_in,
-                &mut pb_rms_out,
-                &mut pb_rms_count,
+                &mut pb_meter,
             );
             if let Some(ref mut p) = pb_out_prod {
                 pump_output(p, &mut pb_audio_out);
@@ -517,34 +546,16 @@ pub fn run_filter(
             &mut rec_denoiser,
             rec_bypass,
             frame_size,
-            &mut rec_rms_in,
-            &mut rec_rms_out,
-            &mut rec_rms_count,
+            &mut rec_meter,
         );
         pump_output(&mut rec_out_prod, &mut rec_audio_out);
 
         // --- Status reporting (every 100ms) ---
         if last_status.elapsed() >= Duration::from_millis(100) {
-            let playback_in = if pb_rms_count > 0 {
-                pb_rms_in / pb_rms_count as f32
-            } else {
-                0.0
-            };
-            let playback_out = if pb_rms_count > 0 {
-                pb_rms_out / pb_rms_count as f32
-            } else {
-                0.0
-            };
-            let recording_in = if rec_rms_count > 0 {
-                rec_rms_in / rec_rms_count as f32
-            } else {
-                0.0
-            };
-            let recording_out = if rec_rms_count > 0 {
-                rec_rms_out / rec_rms_count as f32
-            } else {
-                0.0
-            };
+            let playback_in = pb_meter.mean_input();
+            let playback_out = pb_meter.mean_output();
+            let recording_in = rec_meter.mean_input();
+            let recording_out = rec_meter.mean_output();
             let _ = status_tx.try_send(Status {
                 playback_in,
                 playback_out,
@@ -553,12 +564,8 @@ pub fn run_filter(
                 recording_active: true,
                 recording_detected: true,
             });
-            pb_rms_in = 0.0;
-            pb_rms_out = 0.0;
-            pb_rms_count = 0;
-            rec_rms_in = 0.0;
-            rec_rms_out = 0.0;
-            rec_rms_count = 0;
+            pb_meter.reset();
+            rec_meter.reset();
             last_status = Instant::now();
         }
 

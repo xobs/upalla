@@ -138,6 +138,46 @@ impl AudioBuf {
     }
 }
 
+/// Input and output levels accumulated over one status interval, driving a
+/// chain's pair of VU meters.
+#[derive(Default)]
+struct RmsMeter {
+    input: f32,
+    output: f32,
+    count: u32,
+}
+
+impl RmsMeter {
+    /// Records the input and output level of one processed frame. Both figures
+    /// are per-frame sums across the two channels, so the count advances by two
+    /// and the means come out per channel.
+    fn push(&mut self, input: f32, output: f32) {
+        self.input += input;
+        self.output += output;
+        self.count += 2;
+    }
+
+    fn mean_input(&self) -> f32 {
+        self.mean(self.input)
+    }
+
+    fn mean_output(&self) -> f32 {
+        self.mean(self.output)
+    }
+
+    fn mean(&self, total: f32) -> f32 {
+        if self.count > 0 {
+            total / self.count as f32
+        } else {
+            0.0
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 fn compute_rms(chunk: &[f32]) -> f32 {
     let sum: f32 = chunk.iter().map(|&s| s * s).sum();
     (sum / chunk.len() as f32).sqrt()
@@ -239,7 +279,7 @@ fn create_input(
     let mut last_warn = 0u64;
 
     let stream = device.build_input_stream(
-        config.clone(),
+        *config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             let n = prod.push_slice(data);
             if n < data.len() {
@@ -285,7 +325,7 @@ fn create_output(
     let mut seen_data = false;
 
     let stream = device.build_output_stream(
-        config.clone(),
+        *config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let n = cons.pop_slice(data);
             for s in &mut data[n..] {
@@ -387,9 +427,7 @@ fn process_chain(
     denoiser: &mut Denoiser,
     is_bypass: bool,
     frame_size: usize,
-    rms_in_accum: &mut f32,
-    rms_out_accum: &mut f32,
-    rms_count: &mut u32,
+    meter: &mut RmsMeter,
 ) {
     if let Some(frame) = audio_in.drain_frames(frame_size) {
         let mut sc = StereoChunk {
@@ -406,9 +444,7 @@ fn process_chain(
                 audio_out.data.push(sc.right[i]);
             }
             let r = compute_rms(&sc.left) + compute_rms(&sc.right);
-            *rms_in_accum += r;
-            *rms_out_accum += r;
-            *rms_count += 2;
+            meter.push(r, r);
         } else {
             match denoiser.process_stereo(&sc) {
                 Ok(out) => {
@@ -416,9 +452,10 @@ fn process_chain(
                         audio_out.data.push(out.left[i]);
                         audio_out.data.push(out.right[i]);
                     }
-                    *rms_in_accum += compute_rms(&sc.left) + compute_rms(&sc.right);
-                    *rms_out_accum += compute_rms(&out.left) + compute_rms(&out.right);
-                    *rms_count += 2;
+                    meter.push(
+                        compute_rms(&sc.left) + compute_rms(&sc.right),
+                        compute_rms(&out.left) + compute_rms(&out.right),
+                    );
                 }
                 Err(e) => {
                     log::error!("Denoiser error: {e}, bypassing");
@@ -427,9 +464,7 @@ fn process_chain(
                         audio_out.data.push(sc.right[i]);
                     }
                     let r = compute_rms(&sc.left) + compute_rms(&sc.right);
-                    *rms_in_accum += r;
-                    *rms_out_accum += r;
-                    *rms_count += 2;
+                    meter.push(r, r);
                 }
             }
         }
@@ -546,9 +581,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut pb_audio_in = AudioBuf::new();
     let mut pb_audio_out = AudioBuf::new();
     let mut pb_denoiser = Denoiser::new(&model, 2)?;
-    let mut pb_rms_in = 0.0f32;
-    let mut pb_rms_out = 0.0f32;
-    let mut pb_rms_count = 0u32;
+    let mut pb_meter = RmsMeter::default();
 
     let rec_output_dev = bh_output.as_ref().unwrap_or(&default_output).clone();
     // Start with the recording chain stopped. Neither the mic input nor the
@@ -588,9 +621,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut rec_audio_in = AudioBuf::new();
     let mut rec_audio_out = AudioBuf::new();
     let mut rec_denoiser = Denoiser::new(&model, 2)?;
-    let mut rec_rms_in = 0.0f32;
-    let mut rec_rms_out = 0.0f32;
-    let mut rec_rms_count = 0u32;
+    let mut rec_meter = RmsMeter::default();
 
     log::info!("Input device: {}", device_name(&default_input));
     log::info!("Output device: {}", device_name(&default_output));
@@ -694,7 +725,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                         rec_audio_in.pos = 0;
                         rec_audio_out.data.clear();
                         rec_audio_out.pos = 0;
-                        rec_rms_count = 0;
+                        rec_meter.reset();
                         log::info!("Mic capture disabled (user)");
                     }
                 }
@@ -753,7 +784,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                     rec_audio_in.pos = 0;
                     rec_audio_out.data.clear();
                     rec_audio_out.pos = 0;
-                    rec_rms_count = 0;
+                    rec_meter.reset();
                     log::info!("No BlackHole listener left — recording chain stopped");
                 }
                 _ => {}
@@ -796,7 +827,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                     pb_audio_in.pos = 0;
                     pb_audio_out.data.clear();
                     pb_audio_out.pos = 0;
-                    pb_rms_count = 0;
+                    pb_meter.reset();
                     if yielded {
                         log::info!("Playback chain stopped — yielding BlackHole to recording");
                     } else {
@@ -818,9 +849,7 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 &mut rec_denoiser,
                 is_bypass,
                 frame_size,
-                &mut rec_rms_in,
-                &mut rec_rms_out,
-                &mut rec_rms_count,
+                &mut rec_meter,
             );
             if let Some(ref mut p) = rec_out_prod {
                 pump_output(p, &mut rec_audio_out);
@@ -838,35 +867,17 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 &mut pb_denoiser,
                 is_bypass,
                 frame_size,
-                &mut pb_rms_in,
-                &mut pb_rms_out,
-                &mut pb_rms_count,
+                &mut pb_meter,
             );
             if let Some(ref mut p) = pb_out_prod {
                 pump_output(p, &mut pb_audio_out);
             }
         }
         if last_status.elapsed() >= Duration::from_millis(100) {
-            let playback_in = if pb_rms_count > 0 {
-                pb_rms_in / pb_rms_count as f32
-            } else {
-                0.0
-            };
-            let playback_out = if pb_rms_count > 0 {
-                pb_rms_out / pb_rms_count as f32
-            } else {
-                0.0
-            };
-            let recording_in = if rec_rms_count > 0 {
-                rec_rms_in / rec_rms_count as f32
-            } else {
-                0.0
-            };
-            let recording_out = if rec_rms_count > 0 {
-                rec_rms_out / rec_rms_count as f32
-            } else {
-                0.0
-            };
+            let playback_in = pb_meter.mean_input();
+            let playback_out = pb_meter.mean_output();
+            let recording_in = rec_meter.mean_input();
+            let recording_out = rec_meter.mean_output();
             let _ = status_tx.try_send(Status {
                 playback_in,
                 playback_out,
@@ -879,16 +890,12 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                     log::info!(
                         "First status sent: pb_in={:.6} pb_out={:.6} rec_in={:.6} rec_out={:.6} pb_count={} rec_count={}",
                         playback_in, playback_out, recording_in, recording_out,
-                        pb_rms_count, rec_rms_count
+                        pb_meter.count, rec_meter.count
                     );
                 }
             }
-            pb_rms_in = 0.0;
-            pb_rms_out = 0.0;
-            pb_rms_count = 0;
-            rec_rms_in = 0.0;
-            rec_rms_out = 0.0;
-            rec_rms_count = 0;
+            pb_meter.reset();
+            rec_meter.reset();
             last_status = Instant::now();
         }
 
@@ -907,4 +914,144 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     drop(rec_stream_out);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The meters report a per-channel mean, so a frame at a constant amplitude
+    /// reads back as that amplitude rather than the two-channel sum.
+    #[test]
+    fn meter_reports_per_channel_mean() {
+        let mut meter = RmsMeter::default();
+        meter.push(1.0, 0.5); // per-frame sums across two channels
+        assert_eq!(meter.count, 2);
+        assert_eq!(meter.mean_input(), 0.5);
+        assert_eq!(meter.mean_output(), 0.25);
+
+        meter.push(1.0, 0.5);
+        assert_eq!(meter.count, 4);
+        assert_eq!(
+            meter.mean_input(),
+            0.5,
+            "mean must not drift as frames add up"
+        );
+    }
+
+    #[test]
+    fn empty_meter_reads_zero_rather_than_dividing_by_zero() {
+        let meter = RmsMeter::default();
+        assert_eq!(meter.count, 0);
+        assert_eq!(meter.mean_input(), 0.0);
+        assert_eq!(meter.mean_output(), 0.0);
+    }
+
+    #[test]
+    fn reset_clears_every_field() {
+        let mut meter = RmsMeter::default();
+        meter.push(3.0, 4.0);
+        meter.reset();
+        assert_eq!(meter.count, 0);
+        assert_eq!(meter.input, 0.0);
+        assert_eq!(meter.output, 0.0);
+    }
+
+    /// One interleaved stereo frame with each channel at a constant amplitude.
+    fn frame_at(left: f32, right: f32) -> Vec<f32> {
+        let mut frame = Vec::with_capacity(FRAME_SIZE);
+        for _ in 0..CHUNK {
+            frame.push(left);
+            frame.push(right);
+        }
+        frame
+    }
+
+    /// Drives the real `process_chain` in bypass, where the audio must come out
+    /// untouched and both meters must read the input level. compute_rms of a
+    /// constant signal is that constant, so the per-channel mean of 0.5 and 0.25
+    /// is 0.375.
+    #[test]
+    fn process_chain_bypass_passes_audio_through_and_meters_it() {
+        let mut audio_in = AudioBuf::new();
+        let mut audio_out = AudioBuf::new();
+        let mut meter = RmsMeter::default();
+        let mut denoiser = Denoiser::new(&Model::default(), 2).expect("build denoiser");
+        audio_in.extend(&frame_at(0.5, 0.25));
+
+        process_chain(
+            &mut audio_in,
+            &mut audio_out,
+            &mut denoiser,
+            true,
+            FRAME_SIZE,
+            &mut meter,
+        );
+
+        assert_eq!(audio_out.len(), FRAME_SIZE, "frame must be copied through");
+        assert_eq!(audio_out.data[0], 0.5);
+        assert_eq!(audio_out.data[1], 0.25);
+        assert_eq!(audio_in.len(), 0, "frame must be consumed");
+        assert_eq!(meter.count, 2);
+        assert!((meter.mean_input() - 0.375).abs() < 1e-6);
+        assert!(
+            (meter.mean_output() - meter.mean_input()).abs() < 1e-6,
+            "bypass must report identical input and output levels"
+        );
+    }
+
+    /// The meters must report real levels when audio actually flows through the
+    /// model — the claim a live run cannot check without microphone access.
+    #[test]
+    fn process_chain_meters_real_audio_through_the_denoiser() {
+        let mut audio_in = AudioBuf::new();
+        let mut audio_out = AudioBuf::new();
+        let mut meter = RmsMeter::default();
+        let mut denoiser = Denoiser::new(&Model::default(), 2).expect("build denoiser");
+
+        const FRAMES: usize = 8;
+        for _ in 0..FRAMES {
+            audio_in.extend(&frame_at(0.4, 0.4));
+        }
+        for _ in 0..FRAMES {
+            process_chain(
+                &mut audio_in,
+                &mut audio_out,
+                &mut denoiser,
+                false,
+                FRAME_SIZE,
+                &mut meter,
+            );
+        }
+
+        assert_eq!(audio_in.len(), 0, "every frame must be consumed");
+        assert_eq!(
+            audio_out.len(),
+            FRAMES * FRAME_SIZE,
+            "one frame out per frame in"
+        );
+        assert_eq!(meter.count, (FRAMES * 2) as u32);
+        assert!(
+            (meter.mean_input() - 0.4).abs() < 1e-3,
+            "input meter must read the true input level, got {}",
+            meter.mean_input()
+        );
+        assert!(
+            meter.mean_output() >= 0.0 && meter.mean_output().is_finite(),
+            "output meter must stay a sane level, got {}",
+            meter.mean_output()
+        );
+    }
+
+    #[test]
+    fn drop_excess_bounds_latency_to_whole_frames() {
+        let mut buf = AudioBuf::new();
+        buf.extend(&vec![0.1f32; (MAX_BUFFER_FRAMES + 4) * FRAME_SIZE]);
+        buf.drop_excess();
+        assert_eq!(
+            buf.len(),
+            MAX_BUFFER_FRAMES * FRAME_SIZE,
+            "must drop down to the watermark, in whole frames"
+        );
+    }
 }
