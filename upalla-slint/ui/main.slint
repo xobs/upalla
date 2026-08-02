@@ -70,7 +70,7 @@ export component UpallaWindow inherits Window {
         }
         CheckBox {
             text: "Enabled";
-            checked: root.playback-enabled;
+            checked <=> root.playback-enabled;
         }
 
         HorizontalBox {
@@ -108,7 +108,7 @@ export component UpallaWindow inherits Window {
         }
         CheckBox {
             text: "Enabled";
-            checked: root.recording-enabled;
+            checked <=> root.recording-enabled;
         }
 
         HorizontalBox {

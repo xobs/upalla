@@ -415,7 +415,8 @@ pub fn run_filter(
     model: Model,
     cmd_rx: Receiver<Cmd>,
     status_tx: Sender<Status>,
-    enable: Arc<AtomicBool>,
+    playback_enable: Arc<AtomicBool>,
+    recording_enable: Arc<AtomicBool>,
 ) -> Result<()> {
     cleanup_stale_modules();
 
@@ -711,7 +712,8 @@ pub fn run_filter(
         sink_in.drop_excess();
         src_in.drop_excess();
 
-        let is_bypass = !enable.load(Ordering::Relaxed);
+        let sink_bypass = !playback_enable.load(Ordering::Relaxed);
+        let src_bypass = !recording_enable.load(Ordering::Relaxed);
 
         if let Some(frame) = sink_in.drain_frames(FRAME_SIZE) {
             let mut sc = StereoChunk {
@@ -722,7 +724,7 @@ pub fn run_filter(
                 sc.left[i] = frame[i * 2];
                 sc.right[i] = frame[i * 2 + 1];
             }
-            if is_bypass {
+            if sink_bypass {
                 for i in 0..CHUNK {
                     sink_out.data.push(sc.left[i]);
                     sink_out.data.push(sc.right[i]);
@@ -769,7 +771,7 @@ pub fn run_filter(
                 sc.left[i] = frame[i * 2];
                 sc.right[i] = frame[i * 2 + 1];
             }
-            if is_bypass {
+            if src_bypass {
                 for i in 0..CHUNK {
                     src_out.data.push(sc.left[i]);
                     src_out.data.push(sc.right[i]);

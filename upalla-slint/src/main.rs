@@ -27,8 +27,10 @@ struct SharedState {
     status_rx: Receiver<upalla_pa::Status>,
     previous_sink_idx: i32,
     previous_source_idx: i32,
-    previous_bypass: bool,
-    enabled: Arc<AtomicBool>,
+    previous_pb_bypass: bool,
+    previous_rec_bypass: bool,
+    pb_enabled: Arc<AtomicBool>,
+    rec_enabled: Arc<AtomicBool>,
     sink_descriptions: Vec<String>,
     source_descriptions: Vec<String>,
     window: Option<UpallaWindow>,
@@ -73,19 +75,30 @@ fn update_levels(state: &mut SharedState) {
             }
         }
 
+        // Playback checkbox → playback bypass
         let pb_enabled = win.get_playback_enabled();
-        let rec_enabled = win.get_recording_enabled();
-        let enabled = pb_enabled || rec_enabled;
-        if enabled != !state.previous_bypass {
-            state.previous_bypass = !enabled;
-            state.pa.set_bypass(!enabled);
-            state.enabled.store(enabled, Ordering::Relaxed);
-        } else if !enabled != state.pa.bypass() {
-            let bypass = state.pa.bypass();
+        if pb_enabled != !state.previous_pb_bypass {
+            state.previous_pb_bypass = !pb_enabled;
+            state.pa.set_playback_bypass(!pb_enabled);
+            state.pb_enabled.store(pb_enabled, Ordering::Relaxed);
+        } else if !pb_enabled != state.pa.playback_bypass() {
+            let bypass = state.pa.playback_bypass();
             win.set_playback_enabled(!bypass);
+            state.pb_enabled.store(!bypass, Ordering::Relaxed);
+            state.previous_pb_bypass = bypass;
+        }
+
+        // Recording checkbox → recording bypass
+        let rec_enabled = win.get_recording_enabled();
+        if rec_enabled != !state.previous_rec_bypass {
+            state.previous_rec_bypass = !rec_enabled;
+            state.pa.set_recording_bypass(!rec_enabled);
+            state.rec_enabled.store(rec_enabled, Ordering::Relaxed);
+        } else if !rec_enabled != state.pa.recording_bypass() {
+            let bypass = state.pa.recording_bypass();
             win.set_recording_enabled(!bypass);
-            state.enabled.store(!bypass, Ordering::Relaxed);
-            state.previous_bypass = bypass;
+            state.rec_enabled.store(!bypass, Ordering::Relaxed);
+            state.previous_rec_bypass = bypass;
         }
     }
 }
@@ -157,7 +170,8 @@ fn populate_window(pa: &PaFilter, win: &UpallaWindow) {
 
 struct UpallaTray {
     pa: Arc<PaFilter>,
-    enabled: Arc<AtomicBool>,
+    pb_enabled: Arc<AtomicBool>,
+    rec_enabled: Arc<AtomicBool>,
     show_tx: Sender<()>,
 }
 
@@ -193,15 +207,20 @@ impl ksni::Tray for UpallaTray {
             .into(),
             CheckmarkItem {
                 label: "Enabled".into(),
-                checked: self.enabled.load(Ordering::Relaxed),
+                checked: self.pb_enabled.load(Ordering::Relaxed)
+                    && self.rec_enabled.load(Ordering::Relaxed),
                 enabled: true,
                 activate: {
                     let pa = self.pa.clone();
-                    let flag = self.enabled.clone();
+                    let pb_flag = self.pb_enabled.clone();
+                    let rec_flag = self.rec_enabled.clone();
                     Box::new(move |_: &mut Self| {
-                        let new = !flag.load(Ordering::Relaxed);
-                        flag.store(new, Ordering::Relaxed);
-                        pa.set_bypass(!new);
+                        let new =
+                            !(pb_flag.load(Ordering::Relaxed) && rec_flag.load(Ordering::Relaxed));
+                        pb_flag.store(new, Ordering::Relaxed);
+                        rec_flag.store(new, Ordering::Relaxed);
+                        pa.set_playback_bypass(!new);
+                        pa.set_recording_bypass(!new);
                     })
                 },
                 ..Default::default()
@@ -227,8 +246,13 @@ impl ksni::Tray for UpallaTray {
 
 fn main() -> Result<()> {
     env_logger::init();
-    let enabled = Arc::new(AtomicBool::new(true));
-    let pa = Arc::new(PaFilter::new(Model::default(), Arc::clone(&enabled))?);
+    let pb_enabled = Arc::new(AtomicBool::new(true));
+    let rec_enabled = Arc::new(AtomicBool::new(true));
+    let pa = Arc::new(PaFilter::new(
+        Model::default(),
+        Arc::clone(&pb_enabled),
+        Arc::clone(&rec_enabled),
+    )?);
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();
 
@@ -237,8 +261,10 @@ fn main() -> Result<()> {
         status_rx,
         previous_sink_idx: 0,
         previous_source_idx: 0,
-        previous_bypass: false,
-        enabled: enabled.clone(),
+        previous_pb_bypass: false,
+        previous_rec_bypass: false,
+        pb_enabled: pb_enabled.clone(),
+        rec_enabled: rec_enabled.clone(),
         sink_descriptions: Vec::new(),
         source_descriptions: Vec::new(),
         window: None,
@@ -285,7 +311,8 @@ fn main() -> Result<()> {
     // Tray
     UpallaTray {
         pa: pa.clone(),
-        enabled: enabled.clone(),
+        pb_enabled: pb_enabled.clone(),
+        rec_enabled: rec_enabled.clone(),
         show_tx,
     }
     .spawn()

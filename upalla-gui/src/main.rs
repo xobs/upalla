@@ -102,7 +102,11 @@ fn main() -> Result<()> {
     log::info!("Starting Upalla GUI...");
 
     let enabled = Arc::new(AtomicBool::new(true));
-    let pa = Arc::new(PaFilter::new(Model::default(), Arc::clone(&enabled))?);
+    let pa = Arc::new(PaFilter::new(
+        Model::default(),
+        Arc::clone(&enabled),
+        Arc::clone(&enabled),
+    )?);
     let status_rx = pa.status_receiver().clone();
 
     let (control_tx, control_rx) = crossbeam_channel::unbounded();

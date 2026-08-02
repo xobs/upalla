@@ -72,7 +72,10 @@ extern "C" {
 }
 
 /// Reads an array-valued property. `None` if the property is unsupported.
-fn get_object_list(object: AudioObjectID, address: &AudioObjectPropertyAddress) -> Option<Vec<AudioObjectID>> {
+fn get_object_list(
+    object: AudioObjectID,
+    address: &AudioObjectPropertyAddress,
+) -> Option<Vec<AudioObjectID>> {
     let mut size: u32 = 0;
     let status =
         unsafe { AudioObjectGetPropertyDataSize(object, address, 0, ptr::null(), &mut size) };

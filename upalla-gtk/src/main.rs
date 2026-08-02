@@ -28,7 +28,8 @@ struct AppState {
     show_rx: Receiver<()>,
     previous_sink_idx: u32,
     previous_source_idx: u32,
-    previous_bypass: bool,
+    previous_pb_bypass: bool,
+    previous_rec_bypass: bool,
     playback_in_bar: gtk4::ProgressBar,
     playback_out_bar: gtk4::ProgressBar,
     recording_in_bar: gtk4::ProgressBar,
@@ -93,15 +94,26 @@ impl AppState {
             }
         }
 
-        let enabled = self.playback_enabled.is_active() || self.recording_enabled.is_active();
-        if enabled != !self.previous_bypass {
-            self.previous_bypass = !enabled;
-            pa.set_bypass(!enabled);
-        } else if !enabled != pa.bypass() {
-            let bypass = pa.bypass();
+        // Playback checkbox → playback bypass
+        let pb_enabled = self.playback_enabled.is_active();
+        if pb_enabled != !self.previous_pb_bypass {
+            self.previous_pb_bypass = !pb_enabled;
+            pa.set_playback_bypass(!pb_enabled);
+        } else if !pb_enabled != pa.playback_bypass() {
+            let bypass = pa.playback_bypass();
             self.playback_enabled.set_active(!bypass);
+            self.previous_pb_bypass = bypass;
+        }
+
+        // Recording checkbox → recording bypass
+        let rec_enabled = self.recording_enabled.is_active();
+        if rec_enabled != !self.previous_rec_bypass {
+            self.previous_rec_bypass = !rec_enabled;
+            pa.set_recording_bypass(!rec_enabled);
+        } else if !rec_enabled != pa.recording_bypass() {
+            let bypass = pa.recording_bypass();
             self.recording_enabled.set_active(!bypass);
-            self.previous_bypass = bypass;
+            self.previous_rec_bypass = bypass;
         }
     }
 
@@ -264,7 +276,8 @@ fn build_window(app: &gtk4::Application) -> (gtk4::ApplicationWindow, AppState) 
         show_rx: crossbeam_channel::unbounded().1,
         previous_sink_idx: 0,
         previous_source_idx: 0,
-        previous_bypass: false,
+        previous_pb_bypass: false,
+        previous_rec_bypass: false,
         playback_in_bar: pb_in_bar,
         playback_out_bar: pb_out_bar,
         recording_in_bar: rec_in_bar,
@@ -284,7 +297,8 @@ fn build_window(app: &gtk4::Application) -> (gtk4::ApplicationWindow, AppState) 
 
 struct UpallaTray {
     pa: Arc<PaFilter>,
-    enabled: Arc<AtomicBool>,
+    pb_enabled: Arc<AtomicBool>,
+    rec_enabled: Arc<AtomicBool>,
     show_tx: Sender<()>,
 }
 
@@ -322,15 +336,20 @@ impl ksni::Tray for UpallaTray {
             .into(),
             CheckmarkItem {
                 label: "Enabled".into(),
-                checked: self.enabled.load(Ordering::Relaxed),
+                checked: self.pb_enabled.load(Ordering::Relaxed)
+                    && self.rec_enabled.load(Ordering::Relaxed),
                 enabled: true,
                 activate: {
                     let pa = self.pa.clone();
-                    let flag = self.enabled.clone();
+                    let pb_flag = self.pb_enabled.clone();
+                    let rec_flag = self.rec_enabled.clone();
                     Box::new(move |_tray: &mut Self| {
-                        let new_state = !flag.load(Ordering::Relaxed);
-                        flag.store(new_state, Ordering::Relaxed);
-                        pa.set_bypass(!new_state);
+                        let new_state =
+                            !(pb_flag.load(Ordering::Relaxed) && rec_flag.load(Ordering::Relaxed));
+                        pb_flag.store(new_state, Ordering::Relaxed);
+                        rec_flag.store(new_state, Ordering::Relaxed);
+                        pa.set_playback_bypass(!new_state);
+                        pa.set_recording_bypass(!new_state);
                     })
                 },
                 ..Default::default()
@@ -358,8 +377,13 @@ fn main() -> Result<()> {
     env_logger::init();
     log::info!("Starting Upalla GTK4...");
 
-    let enabled = Arc::new(AtomicBool::new(true));
-    let pa = Arc::new(PaFilter::new(Model::default(), Arc::clone(&enabled))?);
+    let pb_enabled = Arc::new(AtomicBool::new(true));
+    let rec_enabled = Arc::new(AtomicBool::new(true));
+    let pa = Arc::new(PaFilter::new(
+        Model::default(),
+        Arc::clone(&pb_enabled),
+        Arc::clone(&rec_enabled),
+    )?);
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();
 
@@ -451,7 +475,8 @@ fn main() -> Result<()> {
     // Tray — spawned before event loop so it's ready when the window appears
     let tray = UpallaTray {
         pa: pa.clone(),
-        enabled: enabled.clone(),
+        pb_enabled: pb_enabled.clone(),
+        rec_enabled: rec_enabled.clone(),
         show_tx,
     };
 

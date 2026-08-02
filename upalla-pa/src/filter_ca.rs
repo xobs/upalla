@@ -349,7 +349,8 @@ pub fn run_filter(
     model: Model,
     cmd_rx: Receiver<Cmd>,
     status_tx: Sender<Status>,
-    enable: Arc<AtomicBool>,
+    playback_enable: Arc<AtomicBool>,
+    recording_enable: Arc<AtomicBool>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let default_input = host
@@ -479,7 +480,8 @@ pub fn run_filter(
             break;
         }
 
-        let is_bypass = !enable.load(Ordering::Relaxed);
+        let pb_bypass = !playback_enable.load(Ordering::Relaxed);
+        let rec_bypass = !recording_enable.load(Ordering::Relaxed);
 
         // --- Playback chain ---
         if has_playback {
@@ -491,7 +493,7 @@ pub fn run_filter(
                 &mut pb_audio_in,
                 &mut pb_audio_out,
                 &mut pb_denoiser,
-                is_bypass,
+                pb_bypass,
                 frame_size,
                 &mut pb_rms_in,
                 &mut pb_rms_out,
@@ -509,7 +511,7 @@ pub fn run_filter(
             &mut rec_audio_in,
             &mut rec_audio_out,
             &mut rec_denoiser,
-            is_bypass,
+            rec_bypass,
             frame_size,
             &mut rec_rms_in,
             &mut rec_rms_out,

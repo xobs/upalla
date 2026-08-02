@@ -9,7 +9,11 @@ fn main() -> Result<()> {
     env_logger::init();
     log::info!("Upalla PulseAudio filter starting...");
 
-    let pa = PaFilter::new(Model::default(), Arc::new(AtomicBool::new(true)))?;
+    let pa = PaFilter::new(
+        Model::default(),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(true)),
+    )?;
 
     let shutting_down = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
