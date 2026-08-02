@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Upalla
+GenericName=Real-time Noise Suppression
+Comment=GPU-agnostic real-time noise suppression using DeepFilterNet3
+Exec=upalla-slint
+Icon=com.upalla.denoiser
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=noise;denoise;audio;microphone;filter;
+StartupNotify=false
