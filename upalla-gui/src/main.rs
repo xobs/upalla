@@ -106,6 +106,7 @@ fn main() -> Result<()> {
         Model::default(),
         Arc::clone(&enabled),
         Arc::clone(&enabled),
+        Arc::new(std::sync::atomic::AtomicU8::new(0)),
     )?);
     let status_rx = pa.status_receiver().clone();
 

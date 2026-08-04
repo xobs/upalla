@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,6 +26,7 @@ pub struct PaFilter {
     status_rx: Receiver<Status>,
     playback_enabled: Arc<AtomicBool>,
     recording_enabled: Arc<AtomicBool>,
+    src_override: Arc<AtomicU8>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -34,6 +35,7 @@ impl PaFilter {
         model: Model,
         playback_enabled: Arc<AtomicBool>,
         recording_enabled: Arc<AtomicBool>,
+        src_override: Arc<AtomicU8>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = bounded::<Cmd>(8);
         let (status_tx, status_rx) = bounded::<Status>(8);
@@ -43,6 +45,7 @@ impl PaFilter {
             .spawn({
                 let playback_enabled = Arc::clone(&playback_enabled);
                 let recording_enabled = Arc::clone(&recording_enabled);
+                let src_override = Arc::clone(&src_override);
                 move || {
                     #[cfg(target_os = "linux")]
                     {
@@ -52,6 +55,7 @@ impl PaFilter {
                             status_tx,
                             playback_enabled,
                             recording_enabled,
+                            src_override,
                         ) {
                             log::error!("PA filter thread error: {e}");
                         }
@@ -64,6 +68,7 @@ impl PaFilter {
                             status_tx,
                             playback_enabled,
                             recording_enabled,
+                            src_override,
                         ) {
                             log::error!("CA filter thread error: {e}");
                         }
@@ -76,8 +81,25 @@ impl PaFilter {
             status_rx,
             playback_enabled,
             recording_enabled,
+            src_override,
             handle,
         })
+    }
+
+    /// Override automatic recording activation. `None` = auto (follow detection),
+    /// `Some(true)` = force capture on, `Some(false)` = force capture off.
+    pub fn set_src_override(&self, override_state: Option<bool>) {
+        let mode = match override_state {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        };
+        self.src_override.store(mode, Ordering::Relaxed);
+    }
+
+    /// Current source-capture override mode: 0 = auto, 1 = forced on, 2 = forced off.
+    pub fn src_override_mode(&self) -> u8 {
+        self.src_override.load(Ordering::Relaxed)
     }
 
     /// Set bypass for both chains together (used by the standalone filter binary).

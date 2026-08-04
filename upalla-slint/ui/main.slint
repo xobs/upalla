@@ -11,6 +11,7 @@ export component UpallaWindow inherits Window {
     in-out property <int> source-index: 0;
     in-out property <bool> playback-enabled: true;
     in-out property <bool> recording-enabled: true;
+    in-out property <bool> recording-active: false;
     in-out property <float> playback-in-level: 0.0;
     in-out property <float> playback-out-level: 0.0;
     in-out property <float> recording-in-level: 0.0;
@@ -21,6 +22,7 @@ export component UpallaWindow inherits Window {
     in-out property <string> recording-out-db: "-60.0 dB";
 
     callback refresh();
+    callback recording-active-toggled(bool);
 
     VerticalBox {
         spacing: 4px;
@@ -106,9 +108,17 @@ export component UpallaWindow inherits Window {
             font-size: 14px;
             font-weight: 700;
         }
-        CheckBox {
-            text: "Enabled";
-            checked <=> root.recording-enabled;
+        HorizontalBox {
+            spacing: 6px;
+            CheckBox {
+                text: "Enabled";
+                checked <=> root.recording-enabled;
+            }
+            CheckBox {
+                text: "Active";
+                checked <=> root.recording-active;
+                toggled => { root.recording-active-toggled(self.checked); }
+            }
         }
 
         HorizontalBox {

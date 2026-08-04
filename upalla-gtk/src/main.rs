@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +42,8 @@ struct AppState {
     source_combo: gtk4::ComboBoxText,
     playback_enabled: gtk4::CheckButton,
     recording_enabled: gtk4::CheckButton,
+    recording_active: gtk4::CheckButton,
+    last_recording_detected: bool,
 }
 
 impl AppState {
@@ -72,6 +74,7 @@ impl AppState {
                 &self.recording_out_label,
                 status.recording_out,
             );
+            self.last_recording_detected = status.recording_detected;
         }
 
         let sink_idx = self.sink_combo.active().unwrap_or(0u32);
@@ -114,6 +117,26 @@ impl AppState {
             let bypass = pa.recording_bypass();
             self.recording_enabled.set_active(!bypass);
             self.previous_rec_bypass = bypass;
+        }
+
+        // Recording "Active" checkbox: reflects capture state; user click overrides.
+        let active = self.recording_active.is_active();
+        match pa.src_override_mode() {
+            0 => {
+                if active != self.last_recording_detected {
+                    // User clicked while in auto mode → force capture on/off.
+                    pa.set_src_override(Some(active));
+                } else {
+                    // Auto: follow the filter's detected capture state.
+                    self.recording_active
+                        .set_active(self.last_recording_detected);
+                }
+            }
+            1 | 2 if active == self.last_recording_detected => {
+                // Forced: user clicked back to the auto state → release override.
+                pa.set_src_override(None);
+            }
+            _ => {}
         }
     }
 
@@ -264,6 +287,10 @@ fn build_window(app: &gtk4::Application) -> (gtk4::ApplicationWindow, AppState) 
     recording_enabled.set_active(true);
     outer.append(&recording_enabled);
 
+    let recording_active = gtk4::CheckButton::with_label("Active");
+    recording_active.set_active(false);
+    outer.append(&recording_active);
+
     let (rec_in_bar, rec_in_label, rec_in_row) = make_bar_row("Raw:");
     outer.append(&rec_in_row);
     let (rec_out_bar, rec_out_label, rec_out_row) = make_bar_row("Filtered:");
@@ -278,6 +305,7 @@ fn build_window(app: &gtk4::Application) -> (gtk4::ApplicationWindow, AppState) 
         previous_source_idx: 0,
         previous_pb_bypass: false,
         previous_rec_bypass: false,
+        last_recording_detected: false,
         playback_in_bar: pb_in_bar,
         playback_out_bar: pb_out_bar,
         recording_in_bar: rec_in_bar,
@@ -290,6 +318,7 @@ fn build_window(app: &gtk4::Application) -> (gtk4::ApplicationWindow, AppState) 
         source_combo,
         playback_enabled,
         recording_enabled,
+        recording_active,
     };
 
     (window, state)
@@ -379,10 +408,12 @@ fn main() -> Result<()> {
 
     let pb_enabled = Arc::new(AtomicBool::new(true));
     let rec_enabled = Arc::new(AtomicBool::new(true));
+    let src_override = Arc::new(AtomicU8::new(0));
     let pa = Arc::new(PaFilter::new(
         Model::default(),
         Arc::clone(&pb_enabled),
         Arc::clone(&rec_enabled),
+        Arc::clone(&src_override),
     )?);
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();

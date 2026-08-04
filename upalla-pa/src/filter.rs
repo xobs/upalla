@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,12 +29,17 @@ const MAX_BUFFER_FRAMES: usize = 8;
 const FRAME_SIZE: usize = CHUNK * 2; // 960 f32 samples = 480 stereo samples = 10ms at 48kHz
 /// How often to check whether any app is listening on the virtual source.
 const LISTENER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+const SINK_GRACE: Duration = Duration::from_secs(3);
 
 pub struct Status {
     pub playback_in: f32,
     pub playback_out: f32,
     pub recording_in: f32,
     pub recording_out: f32,
+    /// True when the recording (src) capture stream is active.
+    pub recording_active: bool,
+    /// True when an app is detected on the virtual source (independent of any override).
+    pub recording_detected: bool,
 }
 
 #[derive(Clone)]
@@ -307,9 +312,13 @@ where
         .collect()
 }
 
-/// Check whether any source output is connected to the named source
-/// using PulseAudio's introspection API.
-fn has_source_outputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
+/// Identify the source outputs (consumers) attached to the named source.
+/// Each entry is `application.name (media, binary, pid)` when available.
+fn source_output_descriptions(
+    mainloop: &mut Mainloop,
+    context: &Context,
+    name: &str,
+) -> Vec<String> {
     let src_idx = Rc::new(RefCell::new(0u32));
     let idx_done = Rc::new(RefCell::new(false));
     let _idx_op = context.introspect().get_source_info_by_name(name, {
@@ -325,26 +334,36 @@ fn has_source_outputs(mainloop: &mut Mainloop, context: &Context, name: &str) ->
             mainloop.iterate(true),
             IterateResult::Quit(_) | IterateResult::Err(_)
         ) {
-            return false;
+            return Vec::new();
         }
     }
     let src_idx = *src_idx.borrow();
     if src_idx == 0 {
-        return false;
+        return Vec::new();
     }
 
-    let has = Rc::new(RefCell::new(false));
+    let descs = Rc::new(RefCell::new(Vec::new()));
     let out_done = Rc::new(RefCell::new(false));
     let _out_op = context.introspect().get_source_output_info_list({
-        let h = has.clone();
-        let d = out_done.clone();
+        let d = descs.clone();
+        let done = out_done.clone();
         move |result| match result {
             ListResult::Item(info) => {
                 if info.source == src_idx {
-                    *h.borrow_mut() = true;
+                    let pl = &info.proplist;
+                    let app = pl.get_str("application.name").unwrap_or_default();
+                    let media = pl.get_str("media.name").unwrap_or_default();
+                    let bin = pl.get_str("application.process.binary").unwrap_or_default();
+                    let pid = pl.get_str("application.process.id").unwrap_or_default();
+                    let desc = if !app.is_empty() {
+                        format!("{app} (media={media}, bin={bin}, pid={pid})")
+                    } else {
+                        format!("media={media}, bin={bin}, pid={pid}")
+                    };
+                    d.borrow_mut().push(desc);
                 }
             }
-            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+            ListResult::End | ListResult::Error => *done.borrow_mut() = true,
         }
     });
     while !*out_done.borrow() {
@@ -352,15 +371,13 @@ fn has_source_outputs(mainloop: &mut Mainloop, context: &Context, name: &str) ->
             mainloop.iterate(true),
             IterateResult::Quit(_) | IterateResult::Err(_)
         ) {
-            return false;
+            break;
         }
     }
-    let active = *has.borrow();
-    active
+    descs.take()
 }
 
-/// Check whether any sink input (app) is connected to a named sink
-/// using PulseAudio's introspection API.
+/// Check whether any sink input (app) is connected to the named sink.
 fn has_sink_inputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
     let sink_idx = Rc::new(RefCell::new(0u32));
     let idx_done = Rc::new(RefCell::new(false));
@@ -407,8 +424,7 @@ fn has_sink_inputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bo
             return false;
         }
     }
-    let active = *has.borrow();
-    active
+    has.take()
 }
 
 pub fn run_filter(
@@ -417,6 +433,7 @@ pub fn run_filter(
     status_tx: Sender<Status>,
     playback_enable: Arc<AtomicBool>,
     recording_enable: Arc<AtomicBool>,
+    src_override: Arc<AtomicU8>,
 ) -> Result<()> {
     cleanup_stale_modules();
 
@@ -485,9 +502,13 @@ pub fn run_filter(
     while *remap_module.borrow() == 0 {
         mainloop.iterate(true);
     }
-    let remap_module_id = *remap_module.borrow();
-    log::info!("Remap source loaded (idx={remap_module_id})");
-    registered_modules.remap = NonZeroU32::new(remap_module_id);
+    // PipeWire persists volume/mute per source name and restores it on
+    // creation. A stale muted state (e.g. from a previous session or host
+    // policy) would make {SRC_VIRTUAL_NAME} output silence forever. Upalla
+    // owns this source, so force it unmuted.
+    let _ = Command::new("pactl")
+        .args(["set-source-mute", SRC_VIRTUAL_NAME, "0"])
+        .output();
 
     let spec = pulse::sample::Spec {
         format: pulse::sample::Format::F32le,
@@ -503,26 +524,16 @@ pub fn run_filter(
         minreq: u32::MAX,
         fragsize: 50,
     });
-    let playback_attr = Some(BufferAttr {
-        maxlength: u32::MAX,
-        tlength: 50,
-        prebuf: u32::MAX,
-        minreq: u32::MAX,
-        fragsize: u32::MAX,
-    });
+    // Use PA defaults for playback (like paplay) — the tiny tlength=50 target
+    // buffer was unreliable under PipeWire for starting stream rendering.
+    let playback_attr: Option<BufferAttr> = None;
 
+    // Playback capture: connected only while apps route audio to the output
+    // null sink, so the desktop's mic indicator stays off when nothing uses
+    // upalla. A grace period avoids audio gaps from transient detection misses.
     let mut sink_rec: Option<Stream> = None;
     let mut capture_sink = false;
-    let mut sink_play = Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
-    let sink_play_dest = "@DEFAULT_SINK@".to_string();
-    sink_play.connect_playback(
-        Some(&sink_play_dest),
-        playback_attr.as_ref(),
-        play_flags,
-        None,
-        None,
-    )?;
-
+    let mut last_sink_active = Instant::now();
     let mut sink_play = Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
     let mut sink_play_dest = "@DEFAULT_SINK@".to_string();
     sink_play.connect_playback(
@@ -553,17 +564,22 @@ pub fn run_filter(
     let mut src_in = AudioBuf::new();
     let mut src_out = AudioBuf::new();
     let mut last_status = Instant::now();
+    let mut last_consumers: Vec<String> = Vec::new();
     let mut rms_accum = [0.0f32; 8];
     let mut rms_count_sink = 0u32;
     let mut rms_count_src = 0u32;
+    let mut last_detected = false;
 
     loop {
         // Periodically check for active apps on our virtual sink and source
         if listener_check.elapsed() >= LISTENER_CHECK_INTERVAL {
+            // Playback chain: capture from the output null sink while apps route to it.
+            // Disconnect only after a grace period so transient detection misses
+            // don't drop app audio.
             let has_sink = has_sink_inputs(&mut mainloop, &context, SINK_NAME);
-            let has_src = has_source_outputs(&mut mainloop, &context, SRC_VIRTUAL_NAME);
-
-            // Playback chain: capture from output null sink when apps route to it
+            if has_sink {
+                last_sink_active = Instant::now();
+            }
             if has_sink && !capture_sink {
                 let Some(mut new_rec) = Stream::new(&mut context, "sink-rec", &spec, None) else {
                     log::error!("Failed to create sink-rec stream");
@@ -584,7 +600,7 @@ pub fn run_filter(
                     }
                     Err(e) => log::error!("Failed to start playback capture: {e}"),
                 }
-            } else if !has_sink && capture_sink {
+            } else if !has_sink && capture_sink && last_sink_active.elapsed() >= SINK_GRACE {
                 sink_in.data.clear();
                 sink_in.pos = 0;
                 sink_out.data.clear();
@@ -596,8 +612,31 @@ pub fn run_filter(
                 log::info!("Playback capture stopped (no sink inputs on {SINK_NAME})");
             }
 
+            let consumers = source_output_descriptions(&mut mainloop, &context, SRC_VIRTUAL_NAME);
+            let has_src = !consumers.is_empty();
+            last_detected = has_src;
+            // Diagnostic: log consumer count/identity whenever the set changes.
+            if consumers != last_consumers {
+                if consumers.is_empty() {
+                    log::info!("Consumers on {SRC_VIRTUAL_NAME}: none");
+                } else {
+                    log::info!(
+                        "Consumers on {SRC_VIRTUAL_NAME} ({}): {}",
+                        consumers.len(),
+                        consumers.join("; ")
+                    );
+                }
+                last_consumers = consumers.clone();
+            }
+            // User override: 0=auto, 1=forced on, 2=forced off
+            let should_capture = match src_override.load(Ordering::Relaxed) {
+                1 => true,
+                2 => false,
+                _ => has_src,
+            };
+
             // Recording chain: capture from mic when apps listen on virtual source
-            if has_src && !capture_src {
+            if should_capture && !capture_src {
                 let Some(mut new_rec) = Stream::new(&mut context, "src-rec", &spec, None) else {
                     log::error!("Failed to create src-rec stream");
                     listener_check = Instant::now();
@@ -613,11 +652,13 @@ pub fn run_filter(
                         src_in.data.clear();
                         src_in.pos = 0;
                         capture_src = true;
-                        log::info!("Mic capture started (listener on {SRC_VIRTUAL_NAME})");
+                        log::info!(
+                            "Mic capture started (listener on {SRC_VIRTUAL_NAME}, recording from {src_rec_source})"
+                        );
                     }
                     Err(e) => log::error!("Failed to start mic capture: {e}"),
                 }
-            } else if !has_src && capture_src {
+            } else if !should_capture && capture_src {
                 src_in.data.clear();
                 src_in.pos = 0;
                 src_out.data.clear();
@@ -658,21 +699,6 @@ pub fn run_filter(
                     )?;
                     sink_out.data.clear();
                     sink_out.pos = 0;
-                    let Some(mut new_rec) = Stream::new(&mut context, "sink-rec", &spec, None)
-                    else {
-                        log::error!("Failed to create sink-rec stream");
-                        break;
-                    };
-                    if let Err(e) = new_rec.connect_record(
-                        Some(&format!("{}.monitor", SINK_NAME)),
-                        record_attr.as_ref(),
-                        recv_flags,
-                    ) {
-                        log::error!("Failed to connect sink-rec: {e}");
-                    } else {
-                        sink_rec = Some(new_rec);
-                        capture_sink = true;
-                    }
                 }
                 Cmd::SetSource(name) => {
                     log::info!("Switching source input to {name}");
@@ -812,7 +838,6 @@ pub fn run_filter(
 
         pump_write(&mut sink_play, &mut sink_out);
         pump_write(&mut src_play, &mut src_out);
-
         if last_status.elapsed() >= Duration::from_millis(100) {
             let playback_in = if rms_count_sink > 0 {
                 (rms_accum[0] + rms_accum[1]) / (2.0 * rms_count_sink as f32)
@@ -839,6 +864,8 @@ pub fn run_filter(
                 playback_out,
                 recording_in,
                 recording_out,
+                recording_active: capture_src,
+                recording_detected: last_detected,
             });
             rms_accum = [0.0; 8];
             rms_count_sink = 0;

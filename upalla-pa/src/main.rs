@@ -13,6 +13,7 @@ fn main() -> Result<()> {
         Model::default(),
         Arc::new(AtomicBool::new(true)),
         Arc::new(AtomicBool::new(true)),
+        Arc::new(std::sync::atomic::AtomicU8::new(0)),
     )?;
 
     let shutting_down = Arc::new(AtomicBool::new(false));

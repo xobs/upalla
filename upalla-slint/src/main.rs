@@ -4,7 +4,7 @@ use ksni::blocking::TrayMethods;
 use slint::{ComponentHandle, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use upalla_core::model::Model;
@@ -31,6 +31,7 @@ struct SharedState {
     previous_rec_bypass: bool,
     pb_enabled: Arc<AtomicBool>,
     rec_enabled: Arc<AtomicBool>,
+    last_recording_detected: bool,
     sink_descriptions: Vec<String>,
     source_descriptions: Vec<String>,
     window: Option<UpallaWindow>,
@@ -51,6 +52,7 @@ fn update_levels(state: &mut SharedState) {
             win.set_recording_in_db(format!("{:.1} dB", rec_in.clamp(-60.0, 0.0)).into());
             win.set_recording_out_level(((rec_out + 60.0) / 60.0).clamp(0.0, 1.0));
             win.set_recording_out_db(format!("{:.1} dB", rec_out.clamp(-60.0, 0.0)).into());
+            state.last_recording_detected = status.recording_detected;
         }
     }
 
@@ -100,6 +102,20 @@ fn update_levels(state: &mut SharedState) {
             state.rec_enabled.store(!bypass, Ordering::Relaxed);
             state.previous_rec_bypass = bypass;
         }
+
+        // Recording "Active" checkbox: reflects capture state; user click overrides.
+        let active = win.get_recording_active();
+        match state.pa.src_override_mode() {
+            0 => {
+                // Auto: follow the filter's detected capture state.
+                win.set_recording_active(state.last_recording_detected);
+            }
+            1 | 2 if active == state.last_recording_detected => {
+                // Forced: user clicked back to the auto state → release override.
+                state.pa.set_src_override(None);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -125,6 +141,14 @@ fn show_or_create(state: &mut SharedState) {
                     if let Some(w) = weak.upgrade() {
                         populate_window(&pa, &w);
                     }
+                }
+            });
+
+            // Recording "Active" checkbox: user click forces capture on/off.
+            win.on_recording_active_toggled({
+                let pa = state.pa.clone();
+                move |checked| {
+                    pa.set_src_override(Some(checked));
                 }
             });
 
@@ -248,10 +272,12 @@ fn main() -> Result<()> {
     env_logger::init();
     let pb_enabled = Arc::new(AtomicBool::new(true));
     let rec_enabled = Arc::new(AtomicBool::new(true));
+    let src_override = Arc::new(AtomicU8::new(0));
     let pa = Arc::new(PaFilter::new(
         Model::default(),
         Arc::clone(&pb_enabled),
         Arc::clone(&rec_enabled),
+        Arc::clone(&src_override),
     )?);
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();
@@ -265,6 +291,7 @@ fn main() -> Result<()> {
         previous_rec_bypass: false,
         pb_enabled: pb_enabled.clone(),
         rec_enabled: rec_enabled.clone(),
+        last_recording_detected: false,
         sink_descriptions: Vec::new(),
         source_descriptions: Vec::new(),
         window: None,

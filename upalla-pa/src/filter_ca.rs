@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,8 @@ pub struct Status {
     pub playback_out: f32,
     pub recording_in: f32,
     pub recording_out: f32,
+    pub recording_active: bool,
+    pub recording_detected: bool,
 }
 
 #[derive(Clone)]
@@ -351,7 +353,9 @@ pub fn run_filter(
     status_tx: Sender<Status>,
     playback_enable: Arc<AtomicBool>,
     recording_enable: Arc<AtomicBool>,
+    src_override: Arc<AtomicU8>,
 ) -> Result<()> {
+    let _ = &src_override; // CA backend keeps capture always active; override is API parity.
     let host = cpal::default_host();
     let default_input = host
         .default_input_device()
@@ -546,6 +550,8 @@ pub fn run_filter(
                 playback_out,
                 recording_in,
                 recording_out,
+                recording_active: true,
+                recording_detected: true,
             });
             pb_rms_in = 0.0;
             pb_rms_out = 0.0;
