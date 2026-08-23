@@ -92,6 +92,14 @@ The DeepFilterNet3 model is compiled into each binary via `include_bytes!` — n
 - Frame size: 10ms (480 samples at 48 kHz)
 - Deep filter model: ~20ms lookahead
 - Buffer watermark: up to 80ms under load (oldest frames silently dropped when exceeded)
+- `upalla-mac` only: a further 30ms output cushion. The input and output devices
+  run on independent clocks and the processing loop is not a real-time callback,
+  so without a cushion the output starves and zero-fills, which is audible as
+  clipped speech.
+
+The denoiser must run in an optimised build to keep up: release measures around
+RTF 0.13, but a debug build is roughly RTF 1.9 — slower than real time, which
+drops frames and chops speech.
 
 ## License
 

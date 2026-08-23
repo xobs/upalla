@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use upalla_core::denoiser::{Denoiser, StereoChunk, CHUNK};
+use upalla_core::meter::RmsMeter;
 use upalla_core::model::Model;
 
 use crate::blackhole;
@@ -135,46 +136,6 @@ impl AudioBuf {
                 }
             }
         }
-    }
-}
-
-/// Input and output levels accumulated over one status interval, driving a
-/// chain's pair of VU meters.
-#[derive(Default)]
-struct RmsMeter {
-    input: f32,
-    output: f32,
-    count: u32,
-}
-
-impl RmsMeter {
-    /// Records the input and output level of one processed frame. Both figures
-    /// are per-frame sums across the two channels, so the count advances by two
-    /// and the means come out per channel.
-    fn push(&mut self, input: f32, output: f32) {
-        self.input += input;
-        self.output += output;
-        self.count += 2;
-    }
-
-    fn mean_input(&self) -> f32 {
-        self.mean(self.input)
-    }
-
-    fn mean_output(&self) -> f32 {
-        self.mean(self.output)
-    }
-
-    fn mean(&self, total: f32) -> f32 {
-        if self.count > 0 {
-            total / self.count as f32
-        } else {
-            0.0
-        }
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
     }
 }
 
@@ -637,6 +598,24 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut temp_buf = vec![0.0f32; 4096];
     let mut shutdown = false;
 
+    // Without demand detection there is no signal to open the mic on, and no UI
+    // control for it either, so the chain has to run continuously or the app would
+    // never denoise anything at all. macOS then shows Upalla as recording the whole
+    // time — the lesser evil of the two.
+    if !auto_capture {
+        match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+            Ok((si, ci, so, po)) => {
+                rec_stream_in = Some(si);
+                rec_in_cons = Some(ci);
+                rec_stream_out = Some(so);
+                rec_out_prod = Some(po);
+                capture_mic = true;
+                log::info!("No demand detection — recording chain running continuously");
+            }
+            Err(e) => log::error!("Failed to start recording chain: {e}"),
+        }
+    }
+
     log::info!(
         "Audio processing loop running (has_playback={})",
         has_playback
@@ -677,9 +656,10 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 Cmd::SetSource(name) => {
                     log::info!("Switching recording input to {name}");
                     rec_source = Some(name);
-                    // Restart the chain only if it is currently running; otherwise
-                    // the new source is picked up the next time a listener appears.
-                    if capture_mic {
+                    // Restart if the chain is running, or if it should be running
+                    // continuously because there is no demand detection. Otherwise
+                    // the new source is picked up next time a listener appears.
+                    if capture_mic || !auto_capture {
                         rec_stream_in = None;
                         rec_in_cons = None;
                         rec_stream_out = None;
@@ -888,9 +868,9 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 static FIRST: AtomicBool = AtomicBool::new(true);
                 if FIRST.swap(false, Ordering::Relaxed) {
                     log::info!(
-                        "First status sent: pb_in={:.6} pb_out={:.6} rec_in={:.6} rec_out={:.6} pb_count={} rec_count={}",
+                        "First status sent: pb_in={:.6} pb_out={:.6} rec_in={:.6} rec_out={:.6} pb_frames={} rec_frames={}",
                         playback_in, playback_out, recording_in, recording_out,
-                        pb_meter.count, rec_meter.count
+                        pb_meter.frames(), rec_meter.frames()
                     );
                 }
             }
@@ -919,43 +899,6 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The meters report a per-channel mean, so a frame at a constant amplitude
-    /// reads back as that amplitude rather than the two-channel sum.
-    #[test]
-    fn meter_reports_per_channel_mean() {
-        let mut meter = RmsMeter::default();
-        meter.push(1.0, 0.5); // per-frame sums across two channels
-        assert_eq!(meter.count, 2);
-        assert_eq!(meter.mean_input(), 0.5);
-        assert_eq!(meter.mean_output(), 0.25);
-
-        meter.push(1.0, 0.5);
-        assert_eq!(meter.count, 4);
-        assert_eq!(
-            meter.mean_input(),
-            0.5,
-            "mean must not drift as frames add up"
-        );
-    }
-
-    #[test]
-    fn empty_meter_reads_zero_rather_than_dividing_by_zero() {
-        let meter = RmsMeter::default();
-        assert_eq!(meter.count, 0);
-        assert_eq!(meter.mean_input(), 0.0);
-        assert_eq!(meter.mean_output(), 0.0);
-    }
-
-    #[test]
-    fn reset_clears_every_field() {
-        let mut meter = RmsMeter::default();
-        meter.push(3.0, 4.0);
-        meter.reset();
-        assert_eq!(meter.count, 0);
-        assert_eq!(meter.input, 0.0);
-        assert_eq!(meter.output, 0.0);
-    }
 
     /// One interleaved stereo frame with each channel at a constant amplitude.
     fn frame_at(left: f32, right: f32) -> Vec<f32> {
@@ -992,7 +935,7 @@ mod tests {
         assert_eq!(audio_out.data[0], 0.5);
         assert_eq!(audio_out.data[1], 0.25);
         assert_eq!(audio_in.len(), 0, "frame must be consumed");
-        assert_eq!(meter.count, 2);
+        assert_eq!(meter.frames(), 1);
         assert!((meter.mean_input() - 0.375).abs() < 1e-6);
         assert!(
             (meter.mean_output() - meter.mean_input()).abs() < 1e-6,
@@ -1030,7 +973,7 @@ mod tests {
             FRAMES * FRAME_SIZE,
             "one frame out per frame in"
         );
-        assert_eq!(meter.count, (FRAMES * 2) as u32);
+        assert_eq!(meter.frames(), FRAMES as u32);
         assert!(
             (meter.mean_input() - 0.4).abs() < 1e-3,
             "input meter must read the true input level, got {}",
