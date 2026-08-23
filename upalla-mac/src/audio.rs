@@ -376,8 +376,9 @@ fn start_rec_chain(
     stream_in.play()?;
     stream_out.play()?;
     log::info!(
-        "Recording chain started (input: {})",
-        device_name(&input_dev)
+        "Recording chain started ({} -> {})",
+        device_name(&input_dev),
+        device_name(output_dev)
     );
     Ok((stream_in, cons, stream_out, prod))
 }
@@ -858,6 +859,17 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
             let playback_out = pb_meter.mean_output();
             let recording_in = rec_meter.mean_input();
             let recording_out = rec_meter.mean_output();
+            // Levels in dB. A VU meter cannot show the denoiser working during
+            // speech (it preserves speech level and removes noise), so these
+            // numbers are the way to tell: expect rec in/out within a dB while
+            // talking, and out well below in during noise-only stretches.
+            log::debug!(
+                "levels: rec in {:6.1} dB out {:6.1} dB | pb in {:6.1} dB out {:6.1} dB",
+                20.0 * (recording_in + 1e-12).log10(),
+                20.0 * (recording_out + 1e-12).log10(),
+                20.0 * (playback_in + 1e-12).log10(),
+                20.0 * (playback_out + 1e-12).log10(),
+            );
             let _ = status_tx.try_send(Status {
                 playback_in,
                 playback_out,
