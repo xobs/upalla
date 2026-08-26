@@ -30,7 +30,8 @@ struct AppDelegateIvars {
     controls: std::cell::OnceCell<Controls>,
     tray: std::cell::OnceCell<Tray>,
     window: std::cell::OnceCell<Retained<NSWindow>>,
-    bypass_enabled: Cell<bool>,
+    pb_enabled: Cell<bool>,
+    rec_enabled: Cell<bool>,
 }
 
 define_class!(
@@ -138,39 +139,37 @@ define_class!(
             }
         }
 
-        #[unsafe(method(checkboxToggled:))]
-        fn checkbox_toggled(&self, _sender: &AnyObject) {
+        #[unsafe(method(playbackToggled:))]
+        fn playback_toggled(&self, _sender: &AnyObject) {
             // AppKit already flipped the checkbox — read its new state.
             if let Some(controls) = self.ivars().controls.get() {
-                let enabled = controls.enabled();
-                self.ivars().bypass_enabled.set(enabled);
-                let _ = self.ivars().cmd_tx.send(Cmd::SetBypass(!enabled));
-                if let Some(tray) = self.ivars().tray.get() {
-                    tray.enabled_item.setState(if enabled {
-                        NSControlStateValueOn
-                    } else {
-                        NSControlStateValueOff
-                    });
-                }
+                self.apply_playback(controls.playback_enabled());
             }
         }
 
-        #[unsafe(method(toggleEnabled:))]
-        fn toggle_enabled(&self, _sender: &AnyObject) {
-            // Tray click — flip checkbox, then read its new state.
+        #[unsafe(method(recordingToggled:))]
+        fn recording_toggled(&self, _sender: &AnyObject) {
             if let Some(controls) = self.ivars().controls.get() {
-                let was_enabled = controls.enabled();
-                controls.set_enabled(!was_enabled);
-                let enabled = !was_enabled;
-                self.ivars().bypass_enabled.set(enabled);
-                let _ = self.ivars().cmd_tx.send(Cmd::SetBypass(!enabled));
-                if let Some(tray) = self.ivars().tray.get() {
-                    tray.enabled_item.setState(if enabled {
-                        NSControlStateValueOn
-                    } else {
-                        NSControlStateValueOff
-                    });
-                }
+                self.apply_recording(controls.recording_enabled());
+            }
+        }
+
+        #[unsafe(method(togglePlayback:))]
+        fn toggle_playback(&self, _sender: &AnyObject) {
+            // Tray click — flip the checkbox ourselves, then apply.
+            if let Some(controls) = self.ivars().controls.get() {
+                let enabled = !controls.playback_enabled();
+                controls.set_playback_enabled(enabled);
+                self.apply_playback(enabled);
+            }
+        }
+
+        #[unsafe(method(toggleRecording:))]
+        fn toggle_recording(&self, _sender: &AnyObject) {
+            if let Some(controls) = self.ivars().controls.get() {
+                let enabled = !controls.recording_enabled();
+                controls.set_recording_enabled(enabled);
+                self.apply_recording(enabled);
             }
         }
 
@@ -208,6 +207,23 @@ define_class!(
 );
 
 impl AppDelegate {
+    /// Pushes a chain's enabled state to the engine and mirrors it in the tray.
+    fn apply_playback(&self, enabled: bool) {
+        self.ivars().pb_enabled.set(enabled);
+        let _ = self.ivars().cmd_tx.send(Cmd::SetPlaybackBypass(!enabled));
+        if let Some(tray) = self.ivars().tray.get() {
+            tray.pb_enabled_item.setState(check_state(enabled));
+        }
+    }
+
+    fn apply_recording(&self, enabled: bool) {
+        self.ivars().rec_enabled.set(enabled);
+        let _ = self.ivars().cmd_tx.send(Cmd::SetRecordingBypass(!enabled));
+        if let Some(tray) = self.ivars().tray.get() {
+            tray.rec_enabled_item.setState(check_state(enabled));
+        }
+    }
+
     fn new(
         mtm: MainThreadMarker,
         cmd_tx: Sender<Cmd>,
@@ -219,9 +235,18 @@ impl AppDelegate {
             controls: std::cell::OnceCell::new(),
             tray: std::cell::OnceCell::new(),
             window: std::cell::OnceCell::new(),
-            bypass_enabled: Cell::new(true),
+            pb_enabled: Cell::new(true),
+            rec_enabled: Cell::new(true),
         });
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+fn check_state(on: bool) -> objc2_app_kit::NSControlStateValue {
+    if on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
     }
 }
 
@@ -229,11 +254,15 @@ fn create_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained<NSWi
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 450.0)),
+            NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(controls::WINDOW_W, controls::WINDOW_H),
+            ),
+            // Not resizable: the layout uses fixed frames sized to fit exactly,
+            // so a resize would only open dead space rather than reflow anything.
             NSWindowStyleMask::Titled
                 | NSWindowStyleMask::Closable
-                | NSWindowStyleMask::Miniaturizable
-                | NSWindowStyleMask::Resizable,
+                | NSWindowStyleMask::Miniaturizable,
             NSBackingStoreType::Buffered,
             false,
         )
@@ -243,7 +272,9 @@ fn create_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained<NSWi
     let view = window.contentView().expect("window must have content view");
     let controls = controls::build_controls(mtm, &view, delegate);
     let _ = delegate.ivars().controls.set(controls);
-    window.setContentMinSize(NSSize::new(420.0, 380.0));
+    let size = NSSize::new(controls::WINDOW_W, controls::WINDOW_H);
+    window.setContentMinSize(size);
+    window.setContentMaxSize(size);
 
     window
 }

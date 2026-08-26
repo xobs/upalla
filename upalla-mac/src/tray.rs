@@ -14,7 +14,8 @@ use crate::icon;
 #[allow(dead_code)]
 pub struct Tray {
     pub item: Retained<NSStatusItem>,
-    pub enabled_item: Retained<NSMenuItem>,
+    pub pb_enabled_item: Retained<NSMenuItem>,
+    pub rec_enabled_item: Retained<NSMenuItem>,
 }
 
 pub fn create_tray(mtm: MainThreadMarker, target: &AnyObject) -> Tray {
@@ -33,9 +34,13 @@ pub fn create_tray(mtm: MainThreadMarker, target: &AnyObject) -> Tray {
     let show_item = make_item(mtm, "Show Upalla", target, sel!(showWindow:));
     menu.addItem(&show_item);
 
-    let enabled_item = make_item(mtm, "Enabled", target, sel!(toggleEnabled:));
-    enabled_item.setState(NSControlStateValueOn);
-    menu.addItem(&enabled_item);
+    let pb_enabled_item = make_item(mtm, "Playback Enabled", target, sel!(togglePlayback:));
+    pb_enabled_item.setState(NSControlStateValueOn);
+    menu.addItem(&pb_enabled_item);
+
+    let rec_enabled_item = make_item(mtm, "Recording Enabled", target, sel!(toggleRecording:));
+    rec_enabled_item.setState(NSControlStateValueOn);
+    menu.addItem(&rec_enabled_item);
 
     let sep = NSMenuItem::separatorItem(mtm);
     menu.addItem(&sep);
@@ -43,7 +48,11 @@ pub fn create_tray(mtm: MainThreadMarker, target: &AnyObject) -> Tray {
     let quit_item = make_item(mtm, "Quit Upalla", target, sel!(quitApp:));
     menu.addItem(&quit_item);
 
-    Tray { item, enabled_item }
+    Tray {
+        item,
+        pb_enabled_item,
+        rec_enabled_item,
+    }
 }
 
 fn make_item(

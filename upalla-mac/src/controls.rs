@@ -10,6 +10,29 @@ use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use crate::audio::{DeviceInfo, Status};
 
+/// Layout metrics. The window is sized from these so it fits its content exactly
+/// rather than carrying whatever size an earlier arrangement happened to need.
+pub const MARGIN: f64 = 20.0;
+const LABEL_W: f64 = 55.0;
+const POPUP_W: f64 = 200.0;
+const BTN_W: f64 = 30.0;
+const ROW_H: f64 = 24.0;
+const GAP: f64 = 6.0;
+const BAR_W: f64 = 170.0;
+const DB_W: f64 = 60.0;
+const RMS_TITLE_W: f64 = 55.0;
+const HEADER_W: f64 = 80.0;
+const CHECKBOX_W: f64 = 86.0;
+const ACTIVE_W: f64 = 78.0;
+
+/// Eight rows, with a double gap above each section header.
+const CONTENT_H: f64 = 8.0 * ROW_H + 7.0 * GAP + 3.0 * GAP;
+/// The widest row is the device pickers and the meters, which happen to match.
+const CONTENT_W: f64 = LABEL_W + GAP + POPUP_W + GAP + BTN_W;
+
+pub const WINDOW_W: f64 = MARGIN + CONTENT_W + MARGIN;
+pub const WINDOW_H: f64 = MARGIN + CONTENT_H + MARGIN;
+
 pub struct Controls {
     pub pb_raw_slider: Retained<NSSlider>,
     pub pb_raw_label: Retained<NSTextField>,
@@ -21,7 +44,10 @@ pub struct Controls {
     pub rec_filt_label: Retained<NSTextField>,
     pub sink_popup: Retained<NSPopUpButton>,
     pub source_popup: Retained<NSPopUpButton>,
-    pub enabled_checkbox: Retained<NSButton>,
+    pub pb_enabled_checkbox: Retained<NSButton>,
+    pub pb_active_checkbox: Retained<NSButton>,
+    pub rec_enabled_checkbox: Retained<NSButton>,
+    pub rec_active_checkbox: Retained<NSButton>,
 }
 
 fn label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
@@ -80,13 +106,23 @@ pub fn build_controls(mtm: MainThreadMarker, view: &NSView, target: &AnyObject) 
     view.addSubview(&source_popup);
     view.addSubview(&refresh_in);
 
-    let enabled_checkbox = make_checkbox(mtm, target, sel!(checkboxToggled:));
-    view.addSubview(&enabled_checkbox);
-
     let pb_header = bold_label(mtm, "Playback");
     let rec_header = bold_label(mtm, "Recording");
     view.addSubview(&pb_header);
     view.addSubview(&rec_header);
+
+    // One "Enabled" box per chain, sitting beside its section header.
+    let pb_enabled_checkbox = make_checkbox(mtm, target, sel!(playbackToggled:));
+    let rec_enabled_checkbox = make_checkbox(mtm, target, sel!(recordingToggled:));
+    view.addSubview(&pb_enabled_checkbox);
+    view.addSubview(&rec_enabled_checkbox);
+
+    // Read-only: both chains open and close on demand, so this reports the engine's
+    // state rather than offering a control that would fight it.
+    let pb_active_checkbox = make_indicator(mtm, "Active");
+    let rec_active_checkbox = make_indicator(mtm, "Active");
+    view.addSubview(&pb_active_checkbox);
+    view.addSubview(&rec_active_checkbox);
 
     let pb_raw_title = label(mtm, "Raw:");
     let pb_raw_slider = make_slider(mtm);
@@ -125,7 +161,10 @@ pub fn build_controls(mtm: MainThreadMarker, view: &NSView, target: &AnyObject) 
         &in_label,
         &source_popup,
         &refresh_in,
-        &enabled_checkbox,
+        &pb_enabled_checkbox,
+        &rec_enabled_checkbox,
+        &pb_active_checkbox,
+        &rec_active_checkbox,
         &pb_header,
         &rec_header,
         &pb_raw_title,
@@ -153,7 +192,10 @@ pub fn build_controls(mtm: MainThreadMarker, view: &NSView, target: &AnyObject) 
         rec_filt_label,
         sink_popup,
         source_popup,
-        enabled_checkbox,
+        pb_enabled_checkbox,
+        rec_enabled_checkbox,
+        pb_active_checkbox,
+        rec_active_checkbox,
     }
 }
 
@@ -172,6 +214,23 @@ fn make_button(
         )
     };
     b.setBezelStyle(NSBezelStyle::SmallSquare);
+    b
+}
+
+fn set_checkbox(checkbox: &NSButton, on: bool) {
+    checkbox.setState(if on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+}
+
+fn make_indicator(mtm: MainThreadMarker, title: &str) -> Retained<NSButton> {
+    let b = unsafe {
+        NSButton::checkboxWithTitle_target_action(&NSString::from_str(title), None, None, mtm)
+    };
+    b.setState(NSControlStateValueOff);
+    b.setEnabled(false);
     b
 }
 
@@ -196,7 +255,10 @@ fn layout_controls(
     in_label: &NSTextField,
     source_popup: &NSPopUpButton,
     refresh_in: &NSButton,
-    enabled_checkbox: &NSButton,
+    pb_enabled_checkbox: &NSButton,
+    rec_enabled_checkbox: &NSButton,
+    pb_active_checkbox: &NSButton,
+    rec_active_checkbox: &NSButton,
     pb_header: &NSTextField,
     rec_header: &NSTextField,
     pb_raw_title: &NSTextField,
@@ -212,17 +274,13 @@ fn layout_controls(
     rec_filt_slider: &NSSlider,
     rec_filt_label: &NSTextField,
 ) {
-    let label_w: f64 = 55.0;
-    let popup_w: f64 = 200.0;
-    let btn_w: f64 = 30.0;
-    let row_h: f64 = 24.0;
-    let gap: f64 = 6.0;
-    let margin: f64 = 20.0;
-    let bar_w: f64 = 170.0;
-    let db_w: f64 = 60.0;
-    let rms_title_w: f64 = 55.0;
+    let (label_w, popup_w, btn_w) = (LABEL_W, POPUP_W, BTN_W);
+    let (row_h, gap, margin) = (ROW_H, GAP, MARGIN);
+    let (bar_w, db_w, rms_title_w) = (BAR_W, DB_W, RMS_TITLE_W);
+    let (header_w, checkbox_w) = (HEADER_W, CHECKBOX_W);
 
-    let mut y: f64 = 380.0;
+    // Top-down from the top margin, so the bottom margin comes out equal.
+    let mut y: f64 = WINDOW_H - margin - row_h;
 
     out_label.setFrame(NSRect::new(
         NSPoint::new(margin, y),
@@ -252,15 +310,17 @@ fn layout_controls(
     ));
     y -= row_h + gap * 2.0;
 
-    enabled_checkbox.setFrame(NSRect::new(
-        NSPoint::new(margin, y),
-        NSSize::new(100.0, row_h),
-    ));
-    y -= row_h + gap * 2.0;
-
     pb_header.setFrame(NSRect::new(
         NSPoint::new(margin, y),
-        NSSize::new(100.0, row_h),
+        NSSize::new(header_w, row_h),
+    ));
+    pb_enabled_checkbox.setFrame(NSRect::new(
+        NSPoint::new(margin + header_w + gap, y),
+        NSSize::new(checkbox_w, row_h),
+    ));
+    pb_active_checkbox.setFrame(NSRect::new(
+        NSPoint::new(margin + header_w + gap + checkbox_w + gap, y),
+        NSSize::new(ACTIVE_W, row_h),
     ));
     y -= row_h + gap;
 
@@ -294,7 +354,15 @@ fn layout_controls(
 
     rec_header.setFrame(NSRect::new(
         NSPoint::new(margin, y),
-        NSSize::new(100.0, row_h),
+        NSSize::new(header_w, row_h),
+    ));
+    rec_enabled_checkbox.setFrame(NSRect::new(
+        NSPoint::new(margin + header_w + gap, y),
+        NSSize::new(checkbox_w, row_h),
+    ));
+    rec_active_checkbox.setFrame(NSRect::new(
+        NSPoint::new(margin + header_w + gap + checkbox_w + gap, y),
+        NSSize::new(ACTIVE_W, row_h),
     ));
     y -= row_h + gap;
 
@@ -344,6 +412,8 @@ impl Controls {
             &self.rec_filt_label,
             status.recording_out,
         );
+        set_checkbox(&self.pb_active_checkbox, status.playback_active);
+        set_checkbox(&self.rec_active_checkbox, status.recording_active);
     }
 
     fn update_slider(&self, slider: &NSSlider, label: &NSTextField, level: f32) {
@@ -357,12 +427,12 @@ impl Controls {
         label.setStringValue(&NSString::from_str(&format!("{:.1} dB", db)));
     }
 
-    pub fn set_enabled(&self, enabled: bool) {
-        self.enabled_checkbox.setState(if enabled {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        });
+    pub fn set_playback_enabled(&self, enabled: bool) {
+        set_checkbox(&self.pb_enabled_checkbox, enabled);
+    }
+
+    pub fn set_recording_enabled(&self, enabled: bool) {
+        set_checkbox(&self.rec_enabled_checkbox, enabled);
     }
 
     pub fn populate_devices(&self, sinks: &[DeviceInfo], sources: &[DeviceInfo]) {
@@ -437,7 +507,11 @@ impl Controls {
             .unwrap_or_else(|| "@DEFAULT_SOURCE@".into())
     }
 
-    pub fn enabled(&self) -> bool {
-        self.enabled_checkbox.state() == NSControlStateValueOn
+    pub fn playback_enabled(&self) -> bool {
+        self.pb_enabled_checkbox.state() == NSControlStateValueOn
+    }
+
+    pub fn recording_enabled(&self) -> bool {
+        self.rec_enabled_checkbox.state() == NSControlStateValueOn
     }
 }

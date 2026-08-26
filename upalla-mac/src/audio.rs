@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -36,11 +37,25 @@ const OUTPUT_PREFILL_FRAMES: usize = 3; // 30ms
 /// before the processing loop gets a chance to refill.
 const OUTPUT_LOW_WATER_FRAMES: usize = 2; // 20ms
 
+/// How long a running chain may go without its input stream delivering anything
+/// before it is treated as dead.
+///
+/// A silent microphone still delivers callbacks full of zeros, so "no samples at
+/// all" means the stream itself has stopped — which CoreAudio does on a device
+/// switch, sometimes without reporting an error. This is the backstop for the
+/// case where no error callback ever arrives.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct Status {
     pub playback_in: f32,
     pub playback_out: f32,
     pub recording_in: f32,
     pub recording_out: f32,
+    /// Whether each chain currently has its streams open. Both are demand-driven,
+    /// so this reports what the engine is actually doing rather than what was asked
+    /// for.
+    pub playback_active: bool,
+    pub recording_active: bool,
 }
 
 #[derive(Clone)]
@@ -56,7 +71,10 @@ pub struct DeviceLists {
 pub enum Cmd {
     SetSink(String),
     SetSource(String),
-    SetBypass(bool),
+    /// Bypass the playback (BlackHole -> speakers) chain.
+    SetPlaybackBypass(bool),
+    /// Bypass the recording (mic -> BlackHole) chain.
+    SetRecordingBypass(bool),
     #[allow(dead_code)]
     SetMicCapture(bool),
     EnumerateDevices(Sender<DeviceLists>),
@@ -232,7 +250,9 @@ fn create_input(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     tag: &'static str,
+    failed: &Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, ringbuf::HeapCons<f32>)> {
+    let failed = Arc::clone(failed);
     let rb = HeapRb::<f32>::new(RINGBUF_CAP);
     let (mut prod, cons) = rb.split();
 
@@ -264,7 +284,14 @@ fn create_input(
                 }
             }
         },
-        |err| log::error!("Input stream error: {err}"),
+        move |err| {
+            // A dead stream never recovers on its own, and CoreAudio kills streams
+            // whenever devices are switched. Flag it so the audio thread can tear
+            // the chain down and let it be reopened, instead of leaving a chain
+            // that looks alive but carries no audio.
+            log::error!("[{tag}] input stream error: {err}");
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )?;
 
@@ -275,7 +302,9 @@ fn create_output(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     tag: &'static str,
+    failed: &Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, ringbuf::HeapProd<f32>)> {
+    let failed = Arc::clone(failed);
     let rb = HeapRb::<f32>::new(RINGBUF_CAP);
     let (prod, mut cons) = rb.split();
 
@@ -310,11 +339,38 @@ fn create_output(
                 }
             }
         },
-        |err| log::error!("Output stream error: {err}"),
+        move |err| {
+            log::error!("[{tag}] output stream error: {err}");
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )?;
 
     Ok((stream, prod))
+}
+
+/// Resolves an output device by name, defaulting to the system output.
+///
+/// Devices are looked up when a chain starts rather than held from startup:
+/// switching a device (or a virtual driver reconfiguring itself) invalidates the
+/// old handle, and reopening with a stale one fails or lands on the wrong device.
+fn resolve_output(name: Option<&str>) -> Result<cpal::Device> {
+    match name {
+        Some(n) => find_output_by_name(n).with_context(|| format!("Output device not found: {n}")),
+        None => cpal::default_host()
+            .default_output_device()
+            .context("No output device available"),
+    }
+}
+
+/// Resolves an input device by name, defaulting to the system input.
+fn resolve_input(name: Option<&str>) -> Result<cpal::Device> {
+    match name {
+        Some(n) => find_input_by_name(n).with_context(|| format!("Input device not found: {n}")),
+        None => cpal::default_host()
+            .default_input_device()
+            .context("No input device available"),
+    }
 }
 
 /// A started chain: input stream + its consumer, output stream + its producer.
@@ -327,20 +383,16 @@ type Chain = (
 
 /// Opens the BlackHole input and the speaker output and starts both.
 fn start_pb_chain(
-    bh_input: &cpal::Device,
+    bh_input_name: &str,
     sink: Option<&str>,
     config: &cpal::StreamConfig,
+    failed: &Arc<AtomicBool>,
 ) -> Result<Chain> {
-    let output_dev = match sink {
-        Some(name) => {
-            find_output_by_name(name).with_context(|| format!("Output device not found: {name}"))?
-        }
-        None => cpal::default_host()
-            .default_output_device()
-            .context("No output device available")?,
-    };
-    let (stream_in, cons) = create_input(bh_input, config, "pb")?;
-    let (stream_out, mut prod) = create_output(&output_dev, config, "pb")?;
+    let bh_input = &resolve_input(Some(bh_input_name))?;
+    let output_dev = resolve_output(sink)?;
+    failed.store(false, Ordering::Relaxed);
+    let (stream_in, cons) = create_input(bh_input, config, "pb", failed)?;
+    let (stream_out, mut prod) = create_output(&output_dev, config, "pb", failed)?;
     prod.push_slice(&vec![0.0f32; OUTPUT_PREFILL_FRAMES * FRAME_SIZE]);
     stream_in.play()?;
     stream_out.play()?;
@@ -355,19 +407,15 @@ fn start_pb_chain(
 /// Opens the mic input and the BlackHole output and starts both.
 fn start_rec_chain(
     source: Option<&str>,
-    output_dev: &cpal::Device,
+    output_name: Option<&str>,
     config: &cpal::StreamConfig,
+    failed: &Arc<AtomicBool>,
 ) -> Result<Chain> {
-    let input_dev = match source {
-        Some(name) => {
-            find_input_by_name(name).with_context(|| format!("Input device not found: {name}"))?
-        }
-        None => cpal::default_host()
-            .default_input_device()
-            .context("No input device available")?,
-    };
-    let (stream_in, cons) = create_input(&input_dev, config, "rec")?;
-    let (stream_out, mut prod) = create_output(output_dev, config, "rec")?;
+    let input_dev = resolve_input(source)?;
+    let output_dev = resolve_output(output_name)?;
+    failed.store(false, Ordering::Relaxed);
+    let (stream_in, cons) = create_input(&input_dev, config, "rec", failed)?;
+    let (stream_out, mut prod) = create_output(&output_dev, config, "rec", failed)?;
     let prefill = vec![0.0f32; OUTPUT_PREFILL_FRAMES * FRAME_SIZE];
     prod.push_slice(&prefill);
     // Input first: starting a device takes tens of milliseconds, and an output
@@ -378,7 +426,7 @@ fn start_rec_chain(
     log::info!(
         "Recording chain started ({} -> {})",
         device_name(&input_dev),
-        device_name(output_dev)
+        device_name(&output_dev)
     );
     Ok((stream_in, cons, stream_out, prod))
 }
@@ -433,14 +481,20 @@ fn process_chain(
     }
 }
 
-fn pump_input(cons: &mut ringbuf::HeapCons<f32>, audio_in: &mut AudioBuf, temp_buf: &mut [f32]) {
+/// Returns how many samples were moved, which doubles as a liveness signal.
+fn pump_input(
+    cons: &mut ringbuf::HeapCons<f32>,
+    audio_in: &mut AudioBuf,
+    temp_buf: &mut [f32],
+) -> usize {
     let avail = cons.occupied_len();
     if avail == 0 {
-        return;
+        return 0;
     }
     let n = avail.min(temp_buf.len());
     let n = cons.pop_slice(&mut temp_buf[..n]);
     audio_in.extend(&temp_buf[..n]);
+    n
 }
 
 fn pump_output(prod: &mut ringbuf::HeapProd<f32>, audio_out: &mut AudioBuf) {
@@ -488,7 +542,9 @@ pub fn run_audio_engine(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) {
 
 fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> {
     let model = Model::default();
-    let bypass = AtomicBool::new(false);
+    // Each chain is enabled independently, matching the slint frontend.
+    let pb_bypass = AtomicBool::new(false);
+    let rec_bypass = AtomicBool::new(false);
     let host = cpal::default_host();
     let default_input = host
         .default_input_device()
@@ -545,7 +601,18 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     let mut pb_denoiser = Denoiser::new(&model, 2)?;
     let mut pb_meter = RmsMeter::default();
 
-    let rec_output_dev = bh_output.as_ref().unwrap_or(&default_output).clone();
+    // Names, not handles: devices are re-resolved each time a chain starts, so a
+    // device switch cannot leave us reopening a stale handle. `None` means "the
+    // system default at that moment".
+    let rec_output_name: Option<String> = bh_output.as_ref().map(device_name);
+    let bh_input_name: Option<String> = bh_input.as_ref().map(device_name);
+
+    // Set from the stream error callbacks when CoreAudio drops a stream, which is
+    // what happens when devices are switched around.
+    let rec_failed = Arc::new(AtomicBool::new(false));
+    let pb_failed = Arc::new(AtomicBool::new(false));
+    let mut rec_last_data = Instant::now();
+    let mut pb_last_data = Instant::now();
     // Start with the recording chain stopped. Neither the mic input nor the
     // BlackHole output is opened until something else is listening on BlackHole —
     // holding either open makes macOS report Upalla as recording.
@@ -604,7 +671,12 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
     // never denoise anything at all. macOS then shows Upalla as recording the whole
     // time — the lesser evil of the two.
     if !auto_capture {
-        match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+        match start_rec_chain(
+            rec_source.as_deref(),
+            rec_output_name.as_deref(),
+            &config,
+            &rec_failed,
+        ) {
             Ok((si, ci, so, po)) => {
                 rec_stream_in = Some(si);
                 rec_in_cons = Some(ci);
@@ -636,8 +708,8 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                         pb_stream_out = None;
                         pb_out_prod = None;
                         pb_capture_active = false;
-                        if let Some(ref bh) = bh_input {
-                            match start_pb_chain(bh, pb_sink.as_deref(), &config) {
+                        if let Some(ref bh) = bh_input_name {
+                            match start_pb_chain(bh, pb_sink.as_deref(), &config, &pb_failed) {
                                 Ok((si, ci, so, po)) => {
                                     pb_stream_in = Some(si);
                                     pb_in_cons = Some(ci);
@@ -666,7 +738,12 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                         rec_stream_out = None;
                         rec_out_prod = None;
                         capture_mic = false;
-                        match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+                        match start_rec_chain(
+                            rec_source.as_deref(),
+                            rec_output_name.as_deref(),
+                            &config,
+                            &rec_failed,
+                        ) {
                             Ok((si, ci, so, po)) => {
                                 rec_stream_in = Some(si);
                                 rec_in_cons = Some(ci);
@@ -680,12 +757,22 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                     rec_audio_in.data.clear();
                     rec_audio_in.pos = 0;
                 }
-                Cmd::SetBypass(val) => {
-                    bypass.store(val, Ordering::Relaxed);
+                Cmd::SetPlaybackBypass(val) => {
+                    log::info!("Playback denoising {}", if val { "off" } else { "on" });
+                    pb_bypass.store(val, Ordering::Relaxed);
+                }
+                Cmd::SetRecordingBypass(val) => {
+                    log::info!("Recording denoising {}", if val { "off" } else { "on" });
+                    rec_bypass.store(val, Ordering::Relaxed);
                 }
                 Cmd::SetMicCapture(enable) => {
                     if enable && !capture_mic {
-                        match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+                        match start_rec_chain(
+                            rec_source.as_deref(),
+                            rec_output_name.as_deref(),
+                            &config,
+                            &rec_failed,
+                        ) {
                             Ok((si, ci, so, po)) => {
                                 rec_stream_in = Some(si);
                                 rec_in_cons = Some(ci);
@@ -726,14 +813,87 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
             break;
         }
 
-        let is_bypass = bypass.load(Ordering::Relaxed);
+        let pb_is_bypass = pb_bypass.load(Ordering::Relaxed);
+        let rec_is_bypass = rec_bypass.load(Ordering::Relaxed);
 
-        // Start/stop each chain based on whether anything else is using its side of
-        // BlackHole, so macOS only flags us as recording while we are in use.
-        let poll_due = (auto_capture || auto_playback)
-            && last_listener_poll.elapsed() >= Duration::from_millis(500);
+        // While a chain is stopped its liveness clock stays parked at "now", so it
+        // starts counting from the moment the chain actually opens.
+        if !capture_mic {
+            rec_last_data = Instant::now();
+        }
+        if !pb_capture_active {
+            pb_last_data = Instant::now();
+        }
+        if capture_mic && rec_last_data.elapsed() > STREAM_STALL_TIMEOUT {
+            log::warn!("[rec] input stream delivered nothing for {STREAM_STALL_TIMEOUT:?}");
+            rec_failed.store(true, Ordering::Relaxed);
+            rec_last_data = Instant::now();
+        }
+        if pb_capture_active && pb_last_data.elapsed() > STREAM_STALL_TIMEOUT {
+            log::warn!("[pb] input stream delivered nothing for {STREAM_STALL_TIMEOUT:?}");
+            pb_failed.store(true, Ordering::Relaxed);
+            pb_last_data = Instant::now();
+        }
+
+        // A stream died — CoreAudio drops streams whenever devices are switched,
+        // and a dead stream never recovers by itself. Tear the chain down so the
+        // supervision tick below reopens it; leaving it up would keep a chain that
+        // looks alive but carries no audio, which is how switching a device to
+        // BlackHole and back used to kill the mic until the app was restarted.
+        if capture_mic && rec_failed.swap(false, Ordering::Relaxed) {
+            log::warn!("[rec] stream failed — reopening the recording chain");
+            rec_stream_in = None;
+            rec_in_cons = None;
+            rec_stream_out = None;
+            rec_out_prod = None;
+            capture_mic = false;
+            rec_audio_in.data.clear();
+            rec_audio_in.pos = 0;
+            rec_audio_out.data.clear();
+            rec_audio_out.pos = 0;
+            rec_meter.reset();
+            last_listener_poll = Instant::now() - Duration::from_secs(1);
+        }
+        if pb_capture_active && pb_failed.swap(false, Ordering::Relaxed) {
+            log::warn!("[pb] stream failed — reopening the playback chain");
+            pb_stream_in = None;
+            pb_in_cons = None;
+            pb_stream_out = None;
+            pb_out_prod = None;
+            pb_capture_active = false;
+            pb_audio_in.data.clear();
+            pb_audio_in.pos = 0;
+            pb_audio_out.data.clear();
+            pb_audio_out.pos = 0;
+            pb_meter.reset();
+            last_listener_poll = Instant::now() - Duration::from_secs(1);
+        }
+
+        // Supervision tick: start/stop each chain based on whether anything else is
+        // using its side of BlackHole (so macOS only flags us as recording while we
+        // are in use), and reopen anything that dropped out.
+        let poll_due = last_listener_poll.elapsed() >= Duration::from_millis(500);
         if poll_due {
             last_listener_poll = Instant::now();
+        }
+
+        // Without demand detection the chain runs continuously, so keep it up.
+        if poll_due && !auto_capture && !capture_mic {
+            match start_rec_chain(
+                rec_source.as_deref(),
+                rec_output_name.as_deref(),
+                &config,
+                &rec_failed,
+            ) {
+                Ok((si, ci, so, po)) => {
+                    rec_stream_in = Some(si);
+                    rec_in_cons = Some(ci);
+                    rec_stream_out = Some(so);
+                    rec_out_prod = Some(po);
+                    capture_mic = true;
+                }
+                Err(e) => log::error!("Failed to start recording chain: {e}"),
+            }
         }
 
         if poll_due && auto_capture {
@@ -743,7 +903,12 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 // spectrum buffers flush within df_order frames (~50ms) on their
                 // own, and rebuilding the model would stall this thread.
                 Some(true) if !capture_mic => {
-                    match start_rec_chain(rec_source.as_deref(), &rec_output_dev, &config) {
+                    match start_rec_chain(
+                        rec_source.as_deref(),
+                        rec_output_name.as_deref(),
+                        &config,
+                        &rec_failed,
+                    ) {
                         Ok((si, ci, so, po)) => {
                             rec_stream_in = Some(si);
                             rec_in_cons = Some(ci);
@@ -784,8 +949,8 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
             };
             match wants {
                 Some(true) if !pb_capture_active => {
-                    if let Some(ref bh) = bh_input {
-                        match start_pb_chain(bh, pb_sink.as_deref(), &config) {
+                    if let Some(ref bh) = bh_input_name {
+                        match start_pb_chain(bh, pb_sink.as_deref(), &config, &pb_failed) {
                             Ok((si, ci, so, po)) => {
                                 pb_stream_in = Some(si);
                                 pb_in_cons = Some(ci);
@@ -821,14 +986,16 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
 
         if capture_mic {
             if let Some(ref mut c) = rec_in_cons {
-                pump_input(c, &mut rec_audio_in, &mut temp_buf);
+                if pump_input(c, &mut rec_audio_in, &mut temp_buf) > 0 {
+                    rec_last_data = Instant::now();
+                }
             }
             rec_audio_in.drop_excess();
             process_chain(
                 &mut rec_audio_in,
                 &mut rec_audio_out,
                 &mut rec_denoiser,
-                is_bypass,
+                rec_is_bypass,
                 frame_size,
                 &mut rec_meter,
             );
@@ -839,14 +1006,16 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
 
         if has_playback && pb_capture_active {
             if let Some(ref mut c) = pb_in_cons {
-                pump_input(c, &mut pb_audio_in, &mut temp_buf);
+                if pump_input(c, &mut pb_audio_in, &mut temp_buf) > 0 {
+                    pb_last_data = Instant::now();
+                }
             }
             pb_audio_in.drop_excess();
             process_chain(
                 &mut pb_audio_in,
                 &mut pb_audio_out,
                 &mut pb_denoiser,
-                is_bypass,
+                pb_is_bypass,
                 frame_size,
                 &mut pb_meter,
             );
@@ -875,6 +1044,8 @@ fn audio_thread(cmd_rx: Receiver<Cmd>, status_tx: Sender<Status>) -> Result<()> 
                 playback_out,
                 recording_in,
                 recording_out,
+                playback_active: pb_capture_active,
+                recording_active: capture_mic,
             });
             {
                 static FIRST: AtomicBool = AtomicBool::new(true);
