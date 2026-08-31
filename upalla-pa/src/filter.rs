@@ -147,9 +147,17 @@ fn cleanup_stale_modules() {
 }
 
 fn unload_module(idx: u32) {
-    let _ = Command::new("pactl")
+    let out = Command::new("pactl")
         .args(["unload-module", &idx.to_string()])
         .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => log::warn!(
+            "pactl unload-module {idx} failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => log::warn!("pactl unload-module {idx} error: {e}"),
+    }
 }
 
 #[derive(Default)]
@@ -161,17 +169,19 @@ struct RegisteredModules {
 
 impl Drop for RegisteredModules {
     fn drop(&mut self) {
-        if let Some(sink) = self.sink.take().map(|s| s.get()) {
-            log::debug!("Unloading sink module {sink}");
-            unload_module(sink);
+        // Unload in dependency order: the remap source references
+        // `{src_sink}.monitor`, so it must go before its master sink.
+        if let Some(remap) = self.remap.take().map(|s| s.get()) {
+            log::info!("Unloading remap module {remap}");
+            unload_module(remap);
         }
         if let Some(source) = self.source.take().map(|s| s.get()) {
-            log::debug!("Unloading source module {source}");
+            log::info!("Unloading source module {source}");
             unload_module(source);
         }
-        if let Some(remap) = self.remap.take().map(|s| s.get()) {
-            log::debug!("Unloading remap module {remap}");
-            unload_module(remap);
+        if let Some(sink) = self.sink.take().map(|s| s.get()) {
+            log::info!("Unloading sink module {sink}");
+            unload_module(sink);
         }
     }
 }
@@ -377,7 +387,141 @@ fn source_output_descriptions(
     descs.take()
 }
 
-/// Check whether any sink input (app) is connected to the named sink.
+/// Query the server's default sink/source names (may be empty).
+fn server_defaults(mainloop: &mut Mainloop, context: &Context) -> (String, String) {
+    let dsn = Rc::new(RefCell::new(String::new()));
+    let dso = Rc::new(RefCell::new(String::new()));
+    let done = Rc::new(RefCell::new(false));
+    {
+        let sn = dsn.clone();
+        let so = dso.clone();
+        let d = done.clone();
+        context.introspect().get_server_info(move |info| {
+            *sn.borrow_mut() = info
+                .default_sink_name
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            *so.borrow_mut() = info
+                .default_source_name
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            *d.borrow_mut() = true;
+        });
+    }
+    while !*done.borrow() {
+        mainloop.iterate(true);
+    }
+    (dsn.take(), dso.take())
+}
+
+/// Resolve where processed audio should be delivered and where recording
+/// should capture from, excluding upalla's own nodes. If the server's default
+/// device is one of upalla's (e.g. the default sink is upalla_sink, or the
+/// default source is upalla_virtual), routing there would create a feedback
+/// loop with no audible output; fall back to the first real device instead.
+fn resolve_default_devices(mainloop: &mut Mainloop, context: &Context) -> (String, String) {
+    let (default_sink, default_source) = server_defaults(mainloop, context);
+    let sinks = collect_list(mainloop, context, |intro, l, d| {
+        intro.get_sink_info_list(move |result| match result {
+            ListResult::Item(info) => {
+                if let (Some(name), Some(desc)) = (info.name.as_ref(), info.description.as_ref()) {
+                    l.borrow_mut().push(DeviceInfo {
+                        name: name.to_string(),
+                        description: desc.to_string(),
+                    });
+                }
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        });
+    });
+    let sources = collect_list(mainloop, context, |intro, l, d| {
+        intro.get_source_info_list(move |result| match result {
+            ListResult::Item(info) => {
+                if let (Some(name), Some(desc)) = (info.name.as_ref(), info.description.as_ref()) {
+                    l.borrow_mut().push(DeviceInfo {
+                        name: name.to_string(),
+                        description: desc.to_string(),
+                    });
+                }
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        });
+    });
+    let playback = if !default_sink.is_empty() && sinks.iter().any(|s| s.name == default_sink) {
+        default_sink
+    } else {
+        sinks
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "@DEFAULT_SINK@".to_string())
+    };
+    let rec = if !default_source.is_empty() && sources.iter().any(|s| s.name == default_source) {
+        default_source
+    } else {
+        sources
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "@DEFAULT_SOURCE@".to_string())
+    };
+    (playback, rec)
+}
+
+/// Whether the named source is muted or has a channel at zero volume —
+/// either way consumers hear silence.
+fn source_is_silenced(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
+    let silenced = Rc::new(RefCell::new(false));
+    let done = Rc::new(RefCell::new(false));
+    let _op = context.introspect().get_source_info_by_name(name, {
+        let s = silenced.clone();
+        let d = done.clone();
+        move |result| match result {
+            ListResult::Item(info) => {
+                let vol_ok = info.volume.get().iter().all(|v| !v.is_muted());
+                *s.borrow_mut() = info.mute || !vol_ok;
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        }
+    });
+    while !*done.borrow() {
+        if matches!(
+            mainloop.iterate(true),
+            IterateResult::Quit(_) | IterateResult::Err(_)
+        ) {
+            return false;
+        }
+    }
+    silenced.take()
+}
+
+/// Whether the named sink is muted or has a channel at zero volume —
+/// a muted sink silences its monitor, which feeds the virtual source.
+fn sink_is_silenced(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
+    let silenced = Rc::new(RefCell::new(false));
+    let done = Rc::new(RefCell::new(false));
+    let _op = context.introspect().get_sink_info_by_name(name, {
+        let s = silenced.clone();
+        let d = done.clone();
+        move |result| match result {
+            ListResult::Item(info) => {
+                let vol_ok = info.volume.get().iter().all(|v| !v.is_muted());
+                *s.borrow_mut() = info.mute || !vol_ok;
+            }
+            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
+        }
+    });
+    while !*done.borrow() {
+        if matches!(
+            mainloop.iterate(true),
+            IterateResult::Quit(_) | IterateResult::Err(_)
+        ) {
+            return false;
+        }
+    }
+    silenced.take()
+}
+
 fn has_sink_inputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
     let sink_idx = Rc::new(RefCell::new(0u32));
     let idx_done = Rc::new(RefCell::new(false));
@@ -424,7 +568,8 @@ fn has_sink_inputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bo
             return false;
         }
     }
-    has.take()
+    let active = *has.borrow();
+    active
 }
 
 pub fn run_filter(
@@ -502,6 +647,9 @@ pub fn run_filter(
     while *remap_module.borrow() == 0 {
         mainloop.iterate(true);
     }
+    let remap_module_id = *remap_module.borrow();
+    log::info!("Remap source loaded (idx={remap_module_id})");
+    registered_modules.remap = NonZeroU32::new(remap_module_id);
     // PipeWire persists volume/mute per source name and restores it on
     // creation. A stale muted state (e.g. from a previous session or host
     // policy) would make {SRC_VIRTUAL_NAME} output silence forever. Upalla
@@ -531,11 +679,18 @@ pub fn run_filter(
     // Playback capture: connected only while apps route audio to the output
     // null sink, so the desktop's mic indicator stays off when nothing uses
     // upalla. A grace period avoids audio gaps from transient detection misses.
+    // Resolve where processed playback goes and where recording captures from,
+    // excluding upalla's own nodes (defaults pointing at upalla_sink or
+    // upalla_virtual would create silent feedback loops).
+    let (playback_sink, rec_source) = resolve_default_devices(&mut mainloop, &context);
+    log::info!("Playback target: {playback_sink}");
+    log::info!("Recording source: {rec_source}");
+
     let mut sink_rec: Option<Stream> = None;
     let mut capture_sink = false;
     let mut last_sink_active = Instant::now();
     let mut sink_play = Stream::new(&mut context, "sink-play", &spec, None).context("sink play")?;
-    let mut sink_play_dest = "@DEFAULT_SINK@".to_string();
+    let mut sink_play_dest = playback_sink;
     sink_play.connect_playback(
         Some(&sink_play_dest),
         playback_attr.as_ref(),
@@ -545,7 +700,7 @@ pub fn run_filter(
     )?;
 
     let mut src_rec: Option<Stream> = None;
-    let mut src_rec_source = "@DEFAULT_SOURCE@".to_string();
+    let mut src_rec_source = rec_source;
     let mut capture_src = false;
     let mut listener_check = Instant::now();
     let mut src_play = Stream::new(&mut context, "src-play", &spec, None).context("src play")?;
@@ -573,6 +728,31 @@ pub fn run_filter(
     loop {
         // Periodically check for active apps on our virtual sink and source
         if listener_check.elapsed() >= LISTENER_CHECK_INTERVAL {
+            // PipeWire persists volume/mute per source name and host policies may
+            // re-mute this source after startup; upalla owns it and it must stay
+            // audible. Re-assert unmute whenever it has been muted.
+            if source_is_silenced(&mut mainloop, &context, SRC_VIRTUAL_NAME) {
+                log::warn!("{SRC_VIRTUAL_NAME} was muted or at zero volume; restoring");
+                let _ = Command::new("pactl")
+                    .args(["set-source-mute", SRC_VIRTUAL_NAME, "0"])
+                    .output();
+                let _ = Command::new("pactl")
+                    .args(["set-source-volume", SRC_VIRTUAL_NAME, "100%"])
+                    .output();
+            }
+            // The null sinks' monitors feed the recording and playback chains; a
+            // persisted mute on either silences everything downstream.
+            for sink in [SINK_NAME, SRC_SINK_NAME] {
+                if sink_is_silenced(&mut mainloop, &context, sink) {
+                    log::warn!("{sink} was muted or at zero volume; restoring");
+                    let _ = Command::new("pactl")
+                        .args(["set-sink-mute", sink, "0"])
+                        .output();
+                    let _ = Command::new("pactl")
+                        .args(["set-sink-volume", sink, "100%"])
+                        .output();
+                }
+            }
             // Playback chain: capture from the output null sink while apps route to it.
             // Disconnect only after a grace period so transient detection misses
             // don't drop app audio.
@@ -839,6 +1019,25 @@ pub fn run_filter(
         pump_write(&mut sink_play, &mut sink_out);
         pump_write(&mut src_play, &mut src_out);
         if last_status.elapsed() >= Duration::from_millis(100) {
+            static AUDIO_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let at = AUDIO_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Temporary diagnostic: while audio flows, show whether the output
+            // streams are actually rendering (read index advancing) every 2s.
+            if at.is_multiple_of(20) && (capture_src || capture_sink) {
+                let (sw, sr) = src_play
+                    .get_timing_info()
+                    .map(|t| (t.write_index, t.read_index))
+                    .unwrap_or((-1, -1));
+                let (pw, pr) = sink_play
+                    .get_timing_info()
+                    .map(|t| (t.write_index, t.read_index))
+                    .unwrap_or((-1, -1));
+                log::info!(
+                    "AUDIO: src_play w={sw} r={sr} sink_play w={pw} r={pr} src_state={:?} sink_state={:?}",
+                    src_play.get_state(),
+                    sink_play.get_state()
+                );
+            }
             let playback_in = if rms_count_sink > 0 {
                 (rms_accum[0] + rms_accum[1]) / (2.0 * rms_count_sink as f32)
             } else {

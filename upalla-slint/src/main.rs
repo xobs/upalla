@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use ksni::blocking::TrayMethods;
@@ -11,14 +12,23 @@ use upalla_core::model::Model;
 use upalla_pa::PaFilter;
 
 mod icon;
-
 slint::include_modules!();
 
+/// Convert a linear sample RMS to dBFS, flooring at -60 dB.
 fn db_val(sample: f32) -> f32 {
     if sample > 0.0 {
         20.0 * sample.log10()
     } else {
         -60.0
+    }
+}
+
+/// Render a dBFS value, showing `< -60 dB` (not a clamped fake) below the meter floor.
+fn db_label(db: f32) -> String {
+    if db <= -60.0 {
+        "< -60 dB".to_string()
+    } else {
+        format!("{db:.1} dB")
     }
 }
 
@@ -39,19 +49,26 @@ struct SharedState {
 
 fn update_levels(state: &mut SharedState) {
     while let Ok(status) = state.status_rx.try_recv() {
+        log::debug!(
+            "playback_in={:.4} playback_out={:.4} recording_in={:.4} recording_out={:.4}",
+            status.playback_in,
+            status.playback_out,
+            status.recording_in,
+            status.recording_out
+        );
         if let Some(ref win) = state.window {
             let pb_in = db_val(status.playback_in);
             let pb_out = db_val(status.playback_out);
             let rec_in = db_val(status.recording_in);
             let rec_out = db_val(status.recording_out);
             win.set_playback_in_level(((pb_in + 60.0) / 60.0).clamp(0.0, 1.0));
-            win.set_playback_in_db(format!("{:.1} dB", pb_in.clamp(-60.0, 0.0)).into());
+            win.set_playback_in_db(db_label(pb_in).into());
             win.set_playback_out_level(((pb_out + 60.0) / 60.0).clamp(0.0, 1.0));
-            win.set_playback_out_db(format!("{:.1} dB", pb_out.clamp(-60.0, 0.0)).into());
+            win.set_playback_out_db(db_label(pb_out).into());
             win.set_recording_in_level(((rec_in + 60.0) / 60.0).clamp(0.0, 1.0));
-            win.set_recording_in_db(format!("{:.1} dB", rec_in.clamp(-60.0, 0.0)).into());
+            win.set_recording_in_db(db_label(rec_in).into());
             win.set_recording_out_level(((rec_out + 60.0) / 60.0).clamp(0.0, 1.0));
-            win.set_recording_out_db(format!("{:.1} dB", rec_out.clamp(-60.0, 0.0)).into());
+            win.set_recording_out_db(db_label(rec_out).into());
             state.last_recording_detected = status.recording_detected;
         }
     }
@@ -269,7 +286,7 @@ impl ksni::Tray for UpallaTray {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let pb_enabled = Arc::new(AtomicBool::new(true));
     let rec_enabled = Arc::new(AtomicBool::new(true));
     let src_override = Arc::new(AtomicU8::new(0));
@@ -279,6 +296,16 @@ fn main() -> Result<()> {
         Arc::clone(&rec_enabled),
         Arc::clone(&src_override),
     )?);
+    // Stop the filter and exit cleanly on SIGTERM/SIGHUP (e.g. desktop
+    // logout), so the PulseAudio modules are unloaded.
+    {
+        let pa = Arc::clone(&pa);
+        ctrlc::set_handler(move || {
+            pa.shutdown();
+            let _ = slint::quit_event_loop();
+        })
+        .context("ctrlc")?;
+    }
     let status_rx = pa.status_receiver().clone();
     let (show_tx, show_rx) = unbounded();
 

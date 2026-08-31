@@ -169,3 +169,12 @@ impl PaFilter {
         self.handle.is_finished()
     }
 }
+
+impl Drop for PaFilter {
+    /// Ensure the filter thread stops and its PulseAudio modules are unloaded
+    /// whenever the filter is dropped (app quit). Without this the thread is
+    /// detached and the virtual sink/source linger after the app exits.
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
