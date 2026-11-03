@@ -27,8 +27,13 @@ Both GUIs launch to the system tray. They auto-start the PulseAudio filter and s
 ## macOS
 
 ```bash
-# Requires: zigbuild, macOS SDK
-SDKROOT=/path/to/MacOSX.sdk/ cargo zigbuild --target aarch64-apple-darwin --release -p upalla-mac
+# Build and package Upalla.app into target/
+cargo run -p upalla-bundle --release
+
+# Options: --profile dev, --target <triple>, --skip-build
+# Set SDKROOT to pin an SDK; cargo-zigbuild is used when one is given,
+# otherwise it builds natively.
+SDKROOT=/path/to/MacOSX.sdk/ cargo run -p upalla-bundle --release
 ```
 
 The macOS app uses CoreAudio directly (no PulseAudio dependency). It supports BlackHole for system-wide audio capture.

@@ -1,0 +1,14 @@
+[package]
+name = "upalla-bundle"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Builds and packages upalla-mac into a macOS .app bundle"
+
+[[bin]]
+name = "upalla-bundle"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
