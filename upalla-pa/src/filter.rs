@@ -468,60 +468,6 @@ fn resolve_default_devices(mainloop: &mut Mainloop, context: &Context) -> (Strin
     (playback, rec)
 }
 
-/// Whether the named source is muted or has a channel at zero volume —
-/// either way consumers hear silence.
-fn source_is_silenced(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
-    let silenced = Rc::new(RefCell::new(false));
-    let done = Rc::new(RefCell::new(false));
-    let _op = context.introspect().get_source_info_by_name(name, {
-        let s = silenced.clone();
-        let d = done.clone();
-        move |result| match result {
-            ListResult::Item(info) => {
-                let vol_ok = info.volume.get().iter().all(|v| !v.is_muted());
-                *s.borrow_mut() = info.mute || !vol_ok;
-            }
-            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
-        }
-    });
-    while !*done.borrow() {
-        if matches!(
-            mainloop.iterate(true),
-            IterateResult::Quit(_) | IterateResult::Err(_)
-        ) {
-            return false;
-        }
-    }
-    silenced.take()
-}
-
-/// Whether the named sink is muted or has a channel at zero volume —
-/// a muted sink silences its monitor, which feeds the virtual source.
-fn sink_is_silenced(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
-    let silenced = Rc::new(RefCell::new(false));
-    let done = Rc::new(RefCell::new(false));
-    let _op = context.introspect().get_sink_info_by_name(name, {
-        let s = silenced.clone();
-        let d = done.clone();
-        move |result| match result {
-            ListResult::Item(info) => {
-                let vol_ok = info.volume.get().iter().all(|v| !v.is_muted());
-                *s.borrow_mut() = info.mute || !vol_ok;
-            }
-            ListResult::End | ListResult::Error => *d.borrow_mut() = true,
-        }
-    });
-    while !*done.borrow() {
-        if matches!(
-            mainloop.iterate(true),
-            IterateResult::Quit(_) | IterateResult::Err(_)
-        ) {
-            return false;
-        }
-    }
-    silenced.take()
-}
-
 fn has_sink_inputs(mainloop: &mut Mainloop, context: &Context, name: &str) -> bool {
     let sink_idx = Rc::new(RefCell::new(0u32));
     let idx_done = Rc::new(RefCell::new(false));
@@ -728,31 +674,6 @@ pub fn run_filter(
     loop {
         // Periodically check for active apps on our virtual sink and source
         if listener_check.elapsed() >= LISTENER_CHECK_INTERVAL {
-            // PipeWire persists volume/mute per source name and host policies may
-            // re-mute this source after startup; upalla owns it and it must stay
-            // audible. Re-assert unmute whenever it has been muted.
-            if source_is_silenced(&mut mainloop, &context, SRC_VIRTUAL_NAME) {
-                log::warn!("{SRC_VIRTUAL_NAME} was muted or at zero volume; restoring");
-                let _ = Command::new("pactl")
-                    .args(["set-source-mute", SRC_VIRTUAL_NAME, "0"])
-                    .output();
-                let _ = Command::new("pactl")
-                    .args(["set-source-volume", SRC_VIRTUAL_NAME, "100%"])
-                    .output();
-            }
-            // The null sinks' monitors feed the recording and playback chains; a
-            // persisted mute on either silences everything downstream.
-            for sink in [SINK_NAME, SRC_SINK_NAME] {
-                if sink_is_silenced(&mut mainloop, &context, sink) {
-                    log::warn!("{sink} was muted or at zero volume; restoring");
-                    let _ = Command::new("pactl")
-                        .args(["set-sink-mute", sink, "0"])
-                        .output();
-                    let _ = Command::new("pactl")
-                        .args(["set-sink-volume", sink, "100%"])
-                        .output();
-                }
-            }
             // Playback chain: capture from the output null sink while apps route to it.
             // Disconnect only after a grace period so transient detection misses
             // don't drop app audio.
@@ -1019,25 +940,6 @@ pub fn run_filter(
         pump_write(&mut sink_play, &mut sink_out);
         pump_write(&mut src_play, &mut src_out);
         if last_status.elapsed() >= Duration::from_millis(100) {
-            static AUDIO_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let at = AUDIO_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Temporary diagnostic: while audio flows, show whether the output
-            // streams are actually rendering (read index advancing) every 2s.
-            if at.is_multiple_of(20) && (capture_src || capture_sink) {
-                let (sw, sr) = src_play
-                    .get_timing_info()
-                    .map(|t| (t.write_index, t.read_index))
-                    .unwrap_or((-1, -1));
-                let (pw, pr) = sink_play
-                    .get_timing_info()
-                    .map(|t| (t.write_index, t.read_index))
-                    .unwrap_or((-1, -1));
-                log::info!(
-                    "AUDIO: src_play w={sw} r={sr} sink_play w={pw} r={pr} src_state={:?} sink_state={:?}",
-                    src_play.get_state(),
-                    sink_play.get_state()
-                );
-            }
             let playback_in = if rms_count_sink > 0 {
                 (rms_accum[0] + rms_accum[1]) / (2.0 * rms_count_sink as f32)
             } else {
